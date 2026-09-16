@@ -195,7 +195,20 @@ static int wmt_answer_patches(int fd, const char *dir)
          * given, from kernel context, so a bare name is opened
          * relative to / and fails with "load file (…) fail, iRet(-1)".
          * SET_PATCH_NAME does not get prepended for us. */
-        snprintf((char *)pi.name, sizeof pi.name, "%s", full);
+        /* Truncation is CHECKED, not assumed away. pi.name is 256 bytes and
+         * `full` is built in 512, so a long enough firmware directory would
+         * hand the kernel a path that is merely a prefix — and by the note
+         * above, the kernel opens this string exactly as given. The failure
+         * is then "load file (…) fail" from kernel context and a device whose
+         * wlan0 never appears, which is a long way from a buffer size.
+         *
+         * Real paths run ~45 characters, so this cannot fire today. It is
+         * here because the cost of being wrong is an evening, and the cost of
+         * the check is a comparison. */
+        int pn = snprintf((char *)pi.name, sizeof pi.name, "%s", full);
+        if (pn < 0 || (size_t)pn >= sizeof pi.name)
+            blog("wmt: patch path too long (%d bytes, max %d): %s\n",
+                   pn, (int)sizeof pi.name - 1, full);
         if (ioctl(fd, WMT_IOCTL_SET_PATCH_INFO, &pi) < 0)
             blog("wmt: SET_PATCH_INFO(%d,%s) failed errno=%d\n",
                  pi.seq, names[i], errno);
