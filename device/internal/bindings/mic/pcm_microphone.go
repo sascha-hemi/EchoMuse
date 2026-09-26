@@ -13,7 +13,6 @@ import (
 	"github.com/Binozo/GoTinyAlsa/pkg/pcm"
 	"github.com/Binozo/GoTinyAlsa/pkg/tinyalsa"
 	"github.com/wilbowes/EchoMuse/internal/bindings/codec"
-	"github.com/wilbowes/EchoMuse/internal/config"
 	pkgmic "github.com/wilbowes/EchoMuse/pkg/mic"
 )
 
@@ -36,23 +35,10 @@ type PcmMicrophone struct {
 // NewMicrophone returns the pre-configured microphone alsa device and starts
 // the permanent ALSA read loop.
 func NewMicrophone() (*PcmMicrophone, error) {
-	// Channels comes from config so MIC_CHANNELS can override per-board.
-	// biscuit = 9 (8 mics + 1 loopback ref on ch8); radar = 8 (no codec-
-	// side reference; the loopback lives on ch7/ch8 of biscuit only).
-	// Reading config.Get() here is the boot path -- it is initialised
-	// from env at first call, so this works before any controller push.
-	// Read MicChannels off the *Device (env-only, never pushed) rather
-	// than Snapshot() -- the field does not belong on the wire config.
-	channels := config.Get().MicChannels
-	if channels != 8 && channels != 9 {
-		// Unknown value: fall back to the existing safe behaviour
-		// rather than guessing. Matches the project rule of degrading to
-		// old behaviour, never to a wrong answer.
-		log.Printf("mic: MIC_CHANNELS=%d is not a supported capture shape (8 or 9); using 9", channels)
-		channels = 9
-	}
 	device := tinyalsa.NewDevice(cardNr, deviceNr, pcm.Config{
-		Channels:    channels,
+		// PCM24 carries nine transport channels on both biscuit and Radar,
+		// regardless of the number of active physical microphones.
+		Channels:    9,
 		SampleRate:  16000,
 		PeriodSize:  512,
 		PeriodCount: 5,
@@ -127,9 +113,6 @@ func (p *PcmMicrophone) readLoop() {
 	}()
 
 	rate := int64(p.device.DeviceConfig.SampleRate)
-	// bytesPerFrame uses the resolved channel count (Channels in the device
-	// config is whatever NewMicrophone set: 9 on biscuit, 8 on radar), so the
-	// per-period framing matches the ALSA capture shape on either board.
 	bytesPerFrame := p.device.DeviceConfig.Channels * 3 // S24_3LE
 	var (
 		firstArrival time.Time

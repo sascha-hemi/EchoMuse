@@ -132,18 +132,6 @@ type Device struct {
 	// how it stays unmeasured.
 	AecRefSource string
 
-	// MicChannels is the number of audio channels in each ALSA capture
-	// period read from pcmC0D24c. biscuit emits 9 (8 mics + 1 hardware
-	// AEC loopback reference on ch8); radar (Echo 2, MT8163) emits 8
-	// with no in-codec reference. Default 9 preserves today's behaviour,
-	// so a unit that never sets MIC_CHANNELS continues to work on
-	// biscuit. Set on radar to 8 once the capture shape is confirmed on
-	// hardware -- tinypcminfo -D 0 -d 24 was observed to hang and cannot
-	// be queried from here. Env var, not config-pushed, because it is a
-	// property of the board and not an operator setting; the same
-	// rationale as MicGainDb.
-	MicChannels int
-
 	// BLE proxy (passive scan over /dev/stpbt, internal/bluetooth) —
 	// pointer typed so false is expressible over the wire. Default off.
 	BleProxyEnabled *bool
@@ -197,11 +185,6 @@ func (d *Device) loadDefaults() {
 	d.AdcDigitalGain = envInt("ADC_DIGITAL_GAIN", 88)
 	d.AdcMicpga = envInt("ADC_MICPGA", 40)
 	d.MicGainDb = clampMicGainDb(envInt("MIC_GAIN_DB", 24))
-	// MIC_CHANNELS is the number of channels in the ALSA capture period
-	// (pcmC0D24c). 9 for biscuit (8 mics + 1 loopback ref); 8 for radar.
-	// Default 9 keeps a stock biscuit reading the existing probe data
-	// fixture. Set on radar by editing start_server.sh.
-	d.MicChannels = envInt("MIC_CHANNELS", 9)
 	d.BeamAngle = envFloat("BEAM_ANGLE", -1)
 	d.BeamformingEnabled = envBool("BEAMFORMING_ENABLED", true)
 	agcEnabled := envBool("AGC_ENABLED", true)
