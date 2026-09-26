@@ -2016,7 +2016,25 @@ int main(int argc, char **argv)
      * board code checks before calling. */
     board_set_log(netlog_line);
 
-    /* Read the cmdline-named board so a support transcript can answer
+    /* mknod's mode is masked by the umask, so without this every node below
+     * comes out 0644 no matter what it asks for — which is how dhcpcd's hook
+     * script ended up unable to open /dev/null for writing.
+     *
+     * It is restored to 022 as soon as the nodes exist, and that matters more
+     * than it looks: umask is INHERITED by every child, so leaving it at 0
+     * made PID 1 hand a permissive mask to every process on the device. The
+     * syslog and anything a spawned shell created came out world-writable
+     * (-rw-rw-rw-). Narrow the window to the thing that needs it. */
+    umask(0);
+
+    mkdir("/dev", 0755);
+    mkdir("/proc", 0755);
+    mkdir("/sys", 0755);
+    int dtr = mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
+    mount("proc", "/proc", "proc", 0, NULL);
+
+    /* procfs must be mounted before reading the board and system selection.
+     * Read the cmdline-named board so a support transcript can answer
      * "what was this device booting as" without re-flashing. The stamp
      * falls back to BOARD_DEFAULT ("biscuit") for older images and
      * unknown ids, both of which are the right answers for today's
@@ -2034,22 +2052,6 @@ int main(int argc, char **argv)
     const char *board_id = cmdline_board(cmdl);
     note("board id=%s\n", board_id);
 
-    /* mknod's mode is masked by the umask, so without this every node below
-     * comes out 0644 no matter what it asks for — which is how dhcpcd's hook
-     * script ended up unable to open /dev/null for writing.
-     *
-     * It is restored to 022 as soon as the nodes exist, and that matters more
-     * than it looks: umask is INHERITED by every child, so leaving it at 0
-     * made PID 1 hand a permissive mask to every process on the device. The
-     * syslog and anything a spawned shell created came out world-writable
-     * (-rw-rw-rw-). Narrow the window to the thing that needs it. */
-    umask(0);
-
-    mkdir("/dev", 0755);
-    mkdir("/proc", 0755);
-    mkdir("/sys", 0755);
-    int dtr = mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
-    mount("proc", "/proc", "proc", 0, NULL);
     mount("sysfs", "/sys", "sysfs", 0, NULL);
     /* debugfs, for the eMMC's own health.
      *
@@ -2140,8 +2142,7 @@ int main(int argc, char **argv)
     mkdir("/system", 0755);
     /* Which partition, from the stamp the packer put on our own cmdline --
      * see cmdline_system_part(). The cmdline was already read once above
-     * for cmdline_board(); we reuse the same buffer so a second open of
-     * /proc/cmdline does not race against a kernel mid-write. */
+     * for cmdline_board(); reuse it for system selection. */
     int sysp = cmdline_system_part(cmdl);
     char sysdev[48];
     snprintf(sysdev, sizeof sysdev, "/dev/block/mmcblk0p%d", sysp);
