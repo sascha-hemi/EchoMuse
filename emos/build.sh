@@ -95,13 +95,13 @@ fi
 # is the entire reason that mistake was silently bootable. -Os shrinks the
 # text further. llvm-strip then drops what little symbol table survives,
 # because we are not debugging init on hardware and the symbols do not help.
-# The NDK ships llvm-strip alongside clang; reach for the host's `strip` only
-# when the cc used was the system one (none of our builds run that way today,
-# but the path is exercised in CI).
+# Use the NDK strip beside the selected compiler, not an unrelated host
+# strip from PATH. STRIP can override this with another target-capable tool.
 if [ -x "$CC" ]; then
     "$CC" -static -Os -g0 -Wall -DEMOS_BOARD="$EMOS_BOARD" -o "$WORK/init" \
         "$HERE/init/init.c" "$BOARD_SRC"
-    STRIP=$(command -v llvm-strip || command -v strip)
+    STRIP=${STRIP:-$(dirname "$CC")/llvm-strip}
+    [ -x "$STRIP" ] || { echo "missing target strip tool: $STRIP" >&2; exit 1; }
     "$STRIP" "$WORK/init"
 else
     echo "building init in the echomuse-compiler image ($CC not found)"
@@ -205,7 +205,7 @@ install -m 0755 "$WORK/init" "$WORK/root/init"
 # LK gunzips an AArch64 Image, so the kernel must go back in COMPRESSED — the
 # same bytes the reference image carries. Handing it an uncompressed Image
 # silently doubles the image and does not boot.
-EMOS_SYSTEM_PART="${EMOS_SYSTEM_PART:-}" python3 "$HERE/mkboot.py" "$REF" <(python3 - "$REF" <<'EOF'
+EMOS_BOARD="$EMOS_BOARD" EMOS_SYSTEM_PART="${EMOS_SYSTEM_PART:-}" python3 "$HERE/mkboot.py" "$REF" <(python3 - "$REF" <<'EOF'
 import struct, sys
 ref = open(sys.argv[1], "rb").read()
 ksz = struct.unpack("<I", ref[8:12])[0]
