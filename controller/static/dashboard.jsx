@@ -3105,7 +3105,15 @@ service echomuse /data/local/bin/start_server.sh
 //             /system's build.prop in recovery, because TWRP answers getprop
 //             with its own ramdisk. FireOS 6 is Android 7.1; v1 boots only
 //             FireOS 5, so a release of 6 or later on this board means v2.
-const _unlockVerdict = ({ release = '', expdb = '', twrp = '' }) => {
+// Use the stock identity, including when it is read from /system in TWRP.
+const _provisionBoard = (model = '', name = '') => {
+  if (model.trim().toUpperCase() === 'AEORD' && name.trim() === 'radar_puffin') return 'radar';
+  if (model.trim().toUpperCase() === 'AEOBC' || name.trim() === 'csm_biscuit') return 'biscuit';
+  return '';
+};
+
+const _unlockVerdict = ({ release = '', expdb = '', twrp = '', board = 'biscuit' }) => {
+  if (board !== 'biscuit') return { v2: false, evidence: [] };
   const evidence = [];
   if (expdb.toLowerCase() === '88168858') evidence.push('a bootloader image in expdb');
   const tv = twrp.match(/(\d+)\.(\d+)/);
@@ -4308,7 +4316,14 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // escrow-build-flash sequence the emOS flow runs is not FireOS-5-specific at
     // any step: it reads the device's own boot image, rebuilds it with an init
     // matching that image's kernel, and writes it back.
-    const unlock = _unlockVerdict({ release: effRelease, expdb, twrp });
+    const board = _provisionBoard(model, name);
+    const unlock = _unlockVerdict({ release: effRelease, expdb, twrp, board });
+    if (board === 'radar') {
+      if (!isEmos || !effRelease.startsWith('7.')) {
+        throw new Error('Radar provisioning requires the emOS flow and stock FireOS 6. Nothing has been written.');
+      }
+      addLog('Echo 2nd gen (Radar): FireOS 6 detected. Recovery and boot images must be verified before flashing.');
+    }
     if (unlock.v2 && !isEmos) {
       expectDisconnect.current = true;
       try { await c.close(); } catch {}
@@ -4352,17 +4367,16 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // mounts /system at runtime for bionic and tinyalsa. On an unrecognised
     // board that is not a lower chance of working, it is an unknown one, and
     // the failure lands after the boot partition has been written.
-    const boardOk = (model && model.toLowerCase().includes('amazon'))
-                 || (name && name.toLowerCase().includes('biscuit'));
+    const boardOk = !!board;
     if (!boardOk) {
       if (isEmos) {
         expectDisconnect.current = true;
         try { await c.close(); } catch {}
         setAdb(null);
         throw new Error(
-          `This does not look like an Echo Dot 2nd gen (model "${model || 'unknown'}", `
-          + `codename "${name || 'unknown'}"). emOS is built for biscuit and reuses this `
-          + `board's own kernel and /system, so it cannot be installed on anything else. `
+          `Unsupported Echo identity (model "${model || 'unknown'}", `
+          + `codename "${name || 'unknown'}"). This installer supports Biscuit and Radar `
+          + `and requires a recognised stock identity before continuing. `
           + `Use ?flow=fireos if you meant to provision under FireOS.`);
       }
       addLog('Warning: device may not be an Echo Dot 2nd gen — proceeding anyway.', 'warn');
