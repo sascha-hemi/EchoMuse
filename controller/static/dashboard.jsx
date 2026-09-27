@@ -7601,9 +7601,23 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   // reports no SAE, so a [SAE] network can never be joined however correct the
   // password is, and a 5GHz-only one is invisible to it. Both present as an
   // unexplained failure when someone types a name from memory.
+  async function consoleWpaCommand(con) {
+    // Match init's preferred config and ctrl_interface parsing. em-wifi uses
+    // /data/emos/sockets; a fresh wizard install normally uses Android's path.
+    const out = await con.run(
+      'C=/data/emos/wpa.conf; [ -r "$C" ] || C=/data/misc/wifi/wpa_supplicant.conf; '
+      + 'D=$(awk \'/^[ \\t]*ctrl_interface=/ { sub(/^[ \\t]*ctrl_interface=/, ""); '
+      + 'sub(/^DIR=/, ""); sub(/[ \\t].*$/, ""); if ($0 ~ /^\\//) d=$0 } '
+      + 'END { if (d != "") print d }\' "$C" 2>/dev/null); '
+      + 'echo "EMOS_WPA_CTRL=${D:-/data/misc/wifi/sockets}"');
+    const dir = (out.match(/^EMOS_WPA_CTRL=(\/[^\r\n]*)\r?$/m) || [])[1];
+    if (!dir) throw new Error('Could not read the WiFi control socket from the active configuration.');
+    return "wpa_cli -p '" + dir.replace(/'/g, "'\\''") + "' -i wlan0";
+  }
+
   async function scanWifiConsole(con) {
     if (!con) throw new Error('No serial console — re-run the Reboot and Watch step.');
-    const wpa = 'wpa_cli -p /data/misc/wifi/sockets -i wlan0';
+    const wpa = await consoleWpaCommand(con);
     // Early in the boot the supplicant is not answering yet, so wait for it
     // rather than fail a click the operator could not have known was early.
     for (let i = 0; i < 20 && !/PONG/.test(await con.run(`${wpa} ping`)); i++) {
@@ -7640,9 +7654,10 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   async function runEmosWifi(skipJoin) {
     const con = emosConsole;
     if (!con) throw new Error('No serial console — re-run the Reboot and Watch step.');
+    const wpa = await consoleWpaCommand(con);
     if (skipJoin) {
       const st = await con.run(
-        'wpa_cli -p /data/misc/wifi/sockets -i wlan0 status');
+        `${wpa} status`);
       if (!/wpa_state=COMPLETED/.test(st)) {
         throw new Error('Not skipping: the device reports '
           + `${(st.match(/wpa_state=\S+/) || ['nothing readable'])[0]}, so it is `
@@ -7670,22 +7685,16 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     const hidden = !(wifiNetworks || []).some(n => n.ssidHex === ssidHex);
 
     addLog(`Joining ${wifiSsid}…`);
-    // Every call carries -p. wpa_cli defaults to /var/run/wpa_supplicant and
-    // emOS's supplicant is started with -p/data/misc/wifi/sockets (init.c:1202,
-    // and the same path the FireOS flow uses), so without it every command
-    // fails with "Failed to connect to non-global ctrl_ifname: wlan0". Found
-    // by hand on the console 2026-09-06, before this step had ever run — it
-    // would have failed on its first call.
-    //
+    // Use the active config's socket for every operation, including rollback.
     // wpa_cli against emOS's own supplicant — the real radio, so a network
     // this hardware cannot join fails here rather than after a flash. Note
     // this radio reports no SAE, so it genuinely cannot do WPA3 (#82).
-    const id = (await con.run('wpa_cli -p /data/misc/wifi/sockets -i wlan0 add_network')).trim().split('\n').pop().trim();
+    const id = (await con.run(`${wpa} add_network`)).trim().split('\n').pop().trim();
     if (!/^\d+$/.test(id)) throw new Error(`wpa_cli would not add a network (said "${id}").`);
     // Every set_network is checked: a refused one used to pass silently and
     // surface 30s later as "did not associate".
     const setNet = async (field, value) => {
-      const r = await con.run(`wpa_cli -p /data/misc/wifi/sockets -i wlan0 set_network ${id} ${field} ${value}`);
+      const r = await con.run(`${wpa} set_network ${id} ${field} ${value}`);
       if (!/OK/.test(r)) throw new Error(`wpa_cli refused ${field}: ${r.trim() || 'no answer'}`);
     };
     await setNet('ssid', ssidHex);
@@ -7693,12 +7702,12 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     else await setNet('key_mgmt', 'NONE');
     // Not in the last scan: probe for it by name, or it is never found.
     if (hidden) await setNet('scan_ssid', '1');
-    const en = await con.run(`wpa_cli -p /data/misc/wifi/sockets -i wlan0 enable_network ${id}`);
+    const en = await con.run(`${wpa} enable_network ${id}`);
     if (!/OK/.test(en)) throw new Error(`wpa_cli refused to enable the network: ${en.trim()}`);
 
     // save_config keeps NOTHING without update_config=1 in the conf, and says
     // OK either way — so the device would join now and forget on reboot.
-    const saved = await con.run('wpa_cli -p /data/misc/wifi/sockets -i wlan0 save_config');
+    const saved = await con.run(`${wpa} save_config`);
     if (!/OK/.test(saved)) {
       addLog('wpa_cli could not save the network, so this will be forgotten on '
            + 'reboot. Check update_config=1 in wpa_supplicant.conf.', 'warn');
@@ -7738,7 +7747,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     for (let i = 0; i < 12 && !joined; i++) {
       await new Promise(r => setTimeout(r, 2500));
       const st = await con.run(
-        'wpa_cli -p /data/misc/wifi/sockets -i wlan0 status');
+        `${wpa} status`);
       const state = (st.match(/wpa_state=(\S+)/) || [])[1];
       const raw   = (st.match(/^ssid=(.+)$/m) || [])[1];
       onSsid = raw ? _bytesHex(_wpaUnescape(raw.replace(/\r$/, ''))) : null;
@@ -7749,8 +7758,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // Associated, but to something else. Removing OUR entry is right: the
     // other network is the one that works, and it was here first.
     if (!joined && onSsid && onSsid !== ssidHex) {
-      await con.run(`wpa_cli -p /data/misc/wifi/sockets -i wlan0 remove_network ${id}`);
-      await con.run('wpa_cli -p /data/misc/wifi/sockets -i wlan0 save_config');
+      await con.run(`${wpa} remove_network ${id}`);
+      await con.run(`${wpa} save_config`);
       await con.run('sync');
       throw new Error(
         `The device associated to "${_ssidText(_hexBytes(onSsid))}" rather than `
@@ -7758,14 +7767,13 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         + `"${wifiSsid}" has been removed again, so nothing has changed.\n\n`
         + 'If the network it is on is the one you want, click '
         + '"Skip (already connected)". To force the new one, remove the old '
-        + 'entry over the console first: wpa_cli -p /data/misc/wifi/sockets '
-        + '-i wlan0 list_networks, then remove_network <id> and save_config.');
+        + `entry over the console first: ${wpa} list_networks, then remove_network <id> and save_config.`);
     }
     if (!joined) {
       addLog('Not associating — removing the network so the device is not left '
            + 'retrying it for ever.', 'warn');
-      await con.run(`wpa_cli -p /data/misc/wifi/sockets -i wlan0 remove_network ${id}`);
-      await con.run('wpa_cli -p /data/misc/wifi/sockets -i wlan0 save_config');
+      await con.run(`${wpa} remove_network ${id}`);
+      await con.run(`${wpa} save_config`);
       await con.run('sync');
       throw new Error(
         `The device did not join "${wifiSsid}" within 30s, and the network has `
