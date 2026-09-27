@@ -1166,3 +1166,13 @@ def test_board_specific_init_selection(board, arch, name):
 def test_unsupported_board_architecture_never_falls_back(board, arch):
     with pytest.raises(eb.BuildError):
         eb.init_asset_name(arch, board)
+
+
+def test_stock_without_board_stamp_roundtrips_before_build():
+    stock = bytearray(make_reference())
+    # A real stock image has no emOS board stamp; do not generate this
+    # fixture with pack()'s default, which hid the regression.
+    cmd = bytes(stock[64:576]).split(b'\0', 1)[0]
+    cmd = b' '.join(x for x in cmd.split() if not x.startswith(b'emos.board='))
+    stock[64:576] = cmd.ljust(512, b'\0')
+    assert eb.roundtrip_diff(bytes(stock), ignore_id=True) is None

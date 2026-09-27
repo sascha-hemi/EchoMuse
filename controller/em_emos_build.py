@@ -714,7 +714,7 @@ def roundtrip_diff(ref: bytes, ignore_id: bool = False):
     parts = split_reference(ref)
     try:
         rebuilt = pack(parts, parts["zimage"], parts["dtbs"], parts["ramdisk"],
-                       extra_cmdline="")
+                       extra_cmdline="", board_id="")
     except BuildError as e:
         # A structural refusal from pack() IS a difference, and a more specific
         # one than an offset — reported rather than raised so this function
