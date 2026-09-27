@@ -23,7 +23,8 @@ async def test_radar_refuses_release_with_only_biscuit_inits(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('missing', [False, True])
-async def test_uploaded_radar_bundle_includes_wifi_and_stamps_board(missing):
+async def test_uploaded_radar_bundle_includes_wifi_and_stamps_board(missing, monkeypatch):
+    monkeypatch.setattr(eb, "radar_initramfs_kernel", lambda kernel: kernel)
     import struct
     from test_emos_build import make_reference, fake_init
     zimage = bytearray(1024)

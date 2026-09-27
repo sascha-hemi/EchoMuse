@@ -1176,3 +1176,23 @@ def test_stock_without_board_stamp_roundtrips_before_build():
     cmd = b' '.join(x for x in cmd.split() if not x.startswith(b'emos.board='))
     stock[64:576] = cmd.ljust(512, b'\0')
     assert eb.roundtrip_diff(bytes(stock), ignore_id=True) is None
+
+
+def test_radar_kernel_patch_preserves_layout_and_changes_only_option(monkeypatch):
+    import gzip
+    raw = b'kernel content' * 10000 + b'skip_initramfs\0' + b'padding' * 10000
+    before = b'ARM decompressor prefix' + gzip.compress(raw, compresslevel=1, mtime=0) + b'unchanged trailer'
+    monkeypatch.setattr(eb, 'RADAR_STOCK_ZIMAGE_SHA256', hashlib.sha256(before).hexdigest())
+    after = eb.radar_initramfs_kernel(before)
+    assert len(after) == len(before)
+    offset = before.index(b'\x1f\x8b\x08')
+    assert after[:offset] == before[:offset]
+    decoder = zlib.decompressobj(31)
+    decoded = decoder.decompress(after[offset:])
+    assert decoded == raw.replace(b'skip_initramfs\0', b'keep_initramfs\0')
+    assert decoder.unused_data == b'unchanged trailer'
+
+
+def test_radar_kernel_patch_refuses_unknown_kernel():
+    with pytest.raises(eb.BuildError, match='not the validated'):
+        eb.radar_initramfs_kernel(b'unknown kernel')

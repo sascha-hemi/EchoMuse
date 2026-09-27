@@ -4926,7 +4926,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   //     carries no emos.system= stamp, so emOS mounts SYSTEM_PART_DEFAULT
   //     (emos/init/init.c). C95 on 2026-09-25 had FireOS 6 in system_b beside
   //     a working FireOS 5 system_a; that is a warning, not a refusal.
-  function donorVerdict({ probe, layout, heads, files }) {
+  function donorVerdict({ probe, layout, heads, files, board = 'biscuit' }) {
     const why = [], seen = [], notes = [];
     if (!probe || !probe.complete) {
       return { ok: false, gen: 0, confirmed: seen, notes, reason:
@@ -4953,8 +4953,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         + 'amonet 2 means TWRP 3.7.0 and FireOS 6)');
     }
     if (gen) {
-      seen.push(`amonet ${gen === 6 ? 2 : 1}: expdb ${v2Boot ? 'holds' : 'does not hold'} `
-              + `amonet 2's bootloader, TWRP ${tw}`);
+      seen.push(`${board === 'radar' ? 'Radar unlock' : `amonet ${gen === 6 ? 2 : 1}`}: expdb ${v2Boot ? 'holds' : 'does not hold'} `
+              + `a bootloader image, TWRP ${tw}`);
       const want = gen === 6
         ? { layout: 'nested', release: '7.', arch: 'arm', label: 'FireOS 6' }
         : { layout: 'root', release: '5.', arch: 'arm64', label: 'FireOS 5' };
@@ -6887,7 +6887,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       await c.shell('rm -f /tmp/em_head.img');
       heads.push({ name: t.name, arch: await _kernelArchOf(head) });
     }
-    const gate = donorVerdict({ probe: donorProbe, layout: boot.layout, heads, files });
+    const gate = donorVerdict({ probe: donorProbe, layout: boot.layout, heads, files, board: provBoard });
     for (const line of gate.confirmed) addLog(`  ✓ ${line}`, 'ok');
     for (const line of gate.notes) addLog(`  ${line}`, 'warn');
     if (!gate.ok) throw new Error(gate.reason);
@@ -7100,7 +7100,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     let info = null;
     try { info = JSON.parse(resp.headers.get('X-Build-Info') || 'null'); } catch {}
     if (info) {
-      addLog(`  kernel and device trees carried over from your image `
+      if (info.kernel_patch) addLog('  applied the verified Radar kernel initramfs fix');
+      addLog(`  kernel and device trees built from your image `
            + `(${(info.zimage_size/1024/1024).toFixed(1)} MB + ${info.dtb_size} bytes)`);
       addLog(`  ramdisk ${(info.ramdisk_size/1024).toFixed(0)} KB`);
       addLog(`  cmdline ${info.cmdline}`);

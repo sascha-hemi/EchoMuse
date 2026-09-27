@@ -789,6 +789,41 @@ def init_binary_problems(init_binary: bytes, arch: str = ARCH_ARM64) -> list:
     return problems
 
 
+# FireOS 6.5.7.2 / NS6572_6436. The Radar bootloader appends
+# skip_initramfs; changing the boot header cannot override that argument.
+RADAR_STOCK_ZIMAGE_SHA256 = "dd8609b90db440044aaa71f0085b52bf152235d335b5c60ae9513cc156deca7d"
+
+
+def radar_initramfs_kernel(zimage: bytes) -> bytes:
+    """Disable only the known stock kernel's skip_initramfs option.
+
+    Keep the compressed stream length and every surrounding byte unchanged:
+    the ARM decompressor contains offsets into this image. Unknown kernels
+    are refused rather than applying a string replacement to unverified code.
+    """
+    if hashlib.sha256(zimage).hexdigest() != RADAR_STOCK_ZIMAGE_SHA256:
+        raise BuildError("Radar kernel is not the validated NS6572/6436 stock kernel; refusing to patch it")
+    offset = zimage.find(b"\x1f\x8b\x08")
+    if offset < 0:
+        raise BuildError("Radar kernel has no gzip stream")
+    decoder = zlib.decompressobj(31)
+    raw = decoder.decompress(zimage[offset:])
+    if not decoder.eof or raw.count(b"skip_initramfs\0") != 1:
+        raise BuildError("Radar kernel does not contain the expected initramfs option")
+    size = len(zimage) - offset - len(decoder.unused_data)
+    patched = raw.replace(b"skip_initramfs\0", b"keep_initramfs\0")
+    compressed = gzip.compress(patched, compresslevel=9, mtime=0)
+    padding = size - len(compressed)
+    if not 1 <= padding <= 65537 or compressed[3] != 0:
+        raise BuildError("Radar patched kernel cannot preserve its compressed layout")
+    # Linux 3.18's gunzip supports FNAME, but not FEXTRA.
+    compressed = (compressed[:3] + b"\x08" + compressed[4:10]
+                  + b"p" * (padding - 1) + b"\0" + compressed[10:])
+    if len(compressed) != size or gzip.decompress(compressed) != patched:
+        raise BuildError("Radar patched kernel verification failed")
+    return zimage[:offset] + compressed + zimage[offset + size:]
+
+
 def build_emos_image(reference: bytes, init_binary: bytes, version: str,
                      build_id: str = "", sbin: dict = None,
                      system_part: int = None,
@@ -874,7 +909,8 @@ def build_emos_image(reference: bytes, init_binary: bytes, version: str,
     # honest source for a board we have not been told about by name; the
     # default keeps older callers (and older images) working.
     resolved_board = board_id or reference_board_id(reference) or BOARD_DEFAULT
-    image = pack(parts, parts["zimage"], parts["dtbs"], ramdisk,
+    zimage = radar_initramfs_kernel(parts["zimage"]) if resolved_board == "radar" else parts["zimage"]
+    image = pack(parts, zimage, parts["dtbs"], ramdisk,
                  system_part=system_part, board_id=resolved_board)
     return dict(
         image=image,
@@ -887,6 +923,7 @@ def build_emos_image(reference: bytes, init_binary: bytes, version: str,
         dtb_size=len(parts["dtbs"]),
         ramdisk_size=len(ramdisk),
         board_id=resolved_board,
+        kernel_patch="radar-initramfs" if resolved_board == "radar" else "",
         kernel_addr=parts["kaddr"],
         # Read back out of the image rather than reconstructed, so what the
         # wizard shows is what was actually written. Rebuilding it here meant
