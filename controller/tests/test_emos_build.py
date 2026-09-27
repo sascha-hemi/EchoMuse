@@ -1152,3 +1152,17 @@ def test_em_wifi_writes_a_conf_the_wifi_user_can_read():
             "em-wifi sets the conf 0600 unconditionally again; that mode is "
             "only acceptable after chown has failed"
         )
+
+
+@pytest.mark.parametrize('board,arch,name', [
+    ('biscuit', 'arm64', 'init'), ('biscuit', 'arm', 'init32'),
+    ('radar', 'arm', 'init32-radar'),
+])
+def test_board_specific_init_selection(board, arch, name):
+    assert eb.init_asset_name(arch, board) == name
+
+
+@pytest.mark.parametrize('board,arch', [('radar', 'arm64'), ('unknown', 'arm'), ('radar', '')])
+def test_unsupported_board_architecture_never_falls_back(board, arch):
+    with pytest.raises(eb.BuildError):
+        eb.init_asset_name(arch, board)

@@ -523,6 +523,16 @@ def _fdt_compatible(dtb: bytes) -> str:
     return compatible
 
 
+def init_asset_name(arch: str, board: str = "biscuit") -> str:
+    """Architecture alone cannot distinguish the two ARM board runtimes."""
+    names = {("biscuit", ARCH_ARM64): "init", ("biscuit", ARCH_ARM): "init32",
+             ("radar", ARCH_ARM): "init32-radar"}
+    try:
+        return names[(board, arch)]
+    except KeyError:
+        raise BuildError(f"No emOS init is supported for board {board!r}, architecture {arch!r}")
+
+
 def reference_board_id(ref: bytes) -> str:
     """The DTB-compatible string of the reference, or empty on no answer.
 

@@ -3908,6 +3908,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   // device has connected, rather than inferring it from the device list
   // having grown.
   const [provSerial, setProvSerial] = useState('');
+  const [provBoard, setProvBoard] = useState('');
   const [initFile, setInitFile]     = useState(null);
   const [emosConsole, setEmosConsole] = useState(null);
   const [wifiSsid, setWifiSsid] = useState('');
@@ -4317,6 +4318,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // any step: it reads the device's own boot image, rebuilds it with an init
     // matching that image's kernel, and writes it back.
     const board = _provisionBoard(model, name);
+    setProvBoard(board);
     const unlock = _unlockVerdict({ release: effRelease, expdb, twrp, board });
     if (board === 'radar') {
       if (!isEmos || !effRelease.startsWith('7.')) {
@@ -7051,6 +7053,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // provide one as a side effect of reproducing the boot header's SHA1, and
     // that had to be relaxed for images carrying a stale id.
     fd.append('reference_md5', await _md5Hex(reference));
+    if (!provBoard) throw new Error('Reconnect the device to identify its board before building.');
+    fd.append('board', provBoard);
     // One or the other, never both: the controller resolves the init from the
     // reference's own kernel when asked, and an explicit part wins when the
     // operator picked a file by hand.
