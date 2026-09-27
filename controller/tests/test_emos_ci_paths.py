@@ -33,3 +33,28 @@ output.write_bytes(b"test init")
         assert result.returncode == 0, result.stdout + result.stderr
     for name in ("init", "init32", "init.init_radar"):
         assert (tmp_path / "emos/build" / name).read_bytes() == b"test init"
+
+
+def test_release_compiles_and_bundles_each_board_runtime(tmp_path):
+    """A successful link with weak stubs must not publish a nonfunctional init."""
+    import shlex
+    repo = Path(__file__).resolve().parents[2]
+    workflow = yaml.safe_load((repo / ".github/workflows/emos-release.yml").read_text())
+    steps = [s for j in workflow['jobs'].values() for s in j['steps']]
+    builds = [s for s in steps if s.get('name', '').startswith('Compile init')]
+    outputs = {}
+    for step in builds:
+        shell = step['run'].replace('\\\n', ' ')
+        args = shlex.split(shlex.split(shell.split('docker run', 1)[1])[-1])
+        name = Path(args[args.index('-o') + 1]).name
+        board = 'radar' if name == 'init32-radar' else 'biscuit'
+        assert f'-DEMOS_BOARD={board}' in args
+        assert f'init/boards/boards_{board}.c' in args
+        assert (repo / 'emos' / f'init/boards/boards_{board}.c').is_file()
+        outputs[name] = args[0]
+    assert set(outputs) == {'init', 'init32', 'init32-radar'}
+    assert 'aarch64' in outputs['init']
+    assert 'armv7a' in outputs['init32-radar']
+    bundle = next(s['run'] for s in steps if s.get('name') == 'Bundle the payload')
+    assert all(f'emos/build/{name}' in shlex.split(bundle.replace('\\\n', ' '))
+               for name in outputs)
