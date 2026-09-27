@@ -7059,7 +7059,11 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // reference's own kernel when asked, and an explicit part wins when the
     // operator picked a file by hand.
     if (initBlob) {
-      fd.append('init', initBlob, 'init');
+      if (initBlob.name.toLowerCase().endsWith('.zip')) {
+        fd.append('payload', initBlob, 'emos-payload.zip');
+      } else {
+        fd.append('init', initBlob, 'init');
+      }
     } else {
       fd.append('use_latest_init', '1');
     }
@@ -8396,14 +8400,14 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
                 <Pill accent onClick={() => runStep(5, true)}>Build with the latest emOS release</Pill>
                 <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)', letterSpacing: '0.04em' }}>— or —</div>
                 <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em' }}>
-                  {stepState[5] === 'error' ? 'SELECT A DIFFERENT INIT' : 'YOUR OWN INIT BINARY (AARCH64, STATIC)'}
+                  {stepState[5] === 'error' ? 'SELECT AN INIT OR PAYLOAD BUNDLE' : 'YOUR OWN INIT OR EMOS PAYLOAD BUNDLE (.ZIP)'}
                 </div>
                 <input
                   type="file"
                   onChange={e => setInitFile(e.target.files[0])}
                   style={{ fontFamily: "'DM Mono',monospace", fontSize: 11 }}
                 />
-                {!!initFile && <Pill onClick={() => runStep(5, false)}>Build with this init</Pill>}
+                {!!initFile && <Pill onClick={() => runStep(5, false)}>Build with this file</Pill>}
               </div>
             )}
 

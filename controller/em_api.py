@@ -5338,7 +5338,7 @@ async def _get_provision_emos_init(request: web.Request) -> web.Response:
 # appends to the same POST, so the next field to be added has to be read here
 # or fail CI.
 EMOS_IMAGE_FIELDS = ("reference", "init", "reference_md5", "version",
-                     "use_latest_init", "system_part", "board")
+                     "use_latest_init", "system_part", "board", "payload")
 
 
 @auth.require_admin
@@ -5381,7 +5381,7 @@ async def _post_provision_emos_image(request: web.Request) -> web.Response:
                             f"{field.name!r}, which this endpoint does not "
                             f"read")
                 continue
-            if field.name in ("reference", "init"):
+            if field.name in ("reference", "init", "payload"):
                 parts[field.name] = await field.read()
             elif field.name == "board":
                 parts["board"] = (await field.read()).decode(errors="replace")[:32].strip()
@@ -5403,7 +5403,7 @@ async def _post_provision_emos_image(request: web.Request) -> web.Response:
             return _error("invalid_upload",
                           "Expected multipart field 'reference' — the boot "
                           "image read off the device", 400)
-        if not init_bin and not parts.get("use_latest_init"):
+        if not init_bin and not parts.get("payload") and not parts.get("use_latest_init"):
             return _error("invalid_upload",
                           "Expected multipart field 'init' — the emOS init "
                           "binary — or 'use_latest_init' to resolve it here",
@@ -5449,6 +5449,26 @@ async def _post_provision_emos_image(request: web.Request) -> web.Response:
         # A hand-picked init carries no WiFi tools, matching emos/build.sh.
         sbin = {}
 
+        if parts.get("payload"):
+            try:
+                payload = em_emos_build.read_payload_bundle(parts["payload"])
+                files = payload["files"]
+                name = em_emos_build.init_asset_name(arch, board)
+                if name not in files:
+                    raise em_emos_build.BuildError(f"Payload has no {name} for {board}")
+                init_bin = files[name]
+                problems = em_emos_build.init_binary_problems(init_bin, arch)
+                if problems:
+                    raise em_emos_build.BuildError("; ".join(problems))
+                required = EMOS_SBIN_ASSETS if arch == em_emos_build.ARCH_ARM else ()
+                missing = [n for n in required if n not in files]
+                if missing:
+                    raise em_emos_build.BuildError(f"Payload is missing Wi-Fi tools: {', '.join(missing)}")
+                sbin = {n: files[n] for n in set(required) | set(EMOS_SBIN_BOTH_ARCHES) if n in files}
+                version = payload["version"]
+            except em_emos_build.BuildError as exc:
+                return _error("invalid_payload", str(exc), 400)
+
         # Which FireOS userspace this reference was read beside, stamped onto
         # the image so emOS mounts that one rather than assuming. The WIZARD
         # resolves it, because system_a/system_b are names and TWRP's by-name
@@ -5471,7 +5491,7 @@ async def _post_provision_emos_image(request: web.Request) -> web.Response:
 
         # Also keeps ~3.5MB out of a request that has already hit HA ingress's
         # 413 once (2026-09-06).
-        if parts.get("use_latest_init"):
+        if parts.get("use_latest_init") and not parts.get("payload"):
             arch = em_emos_build.reference_kernel_arch(reference)
             if not arch:
                 # Refused, not defaulted: an init chosen by guess flashes fine
