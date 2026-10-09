@@ -2955,7 +2955,8 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown",
             # on the wake path) and VOICE_PREROLL_DISCARD only for the
             # initial wakeword-triggered turn.
             turn_label      = trigger_label
-            preroll_discard = esphome.VOICE_PREROLL_DISCARD if is_wakeword else 0
+            preroll_discard = em_listen.tail_discard(
+                is_wakeword, session is not None, esphome.VOICE_PREROLL_DISCARD)
             while True:
                 should_continue = False
                 try:
@@ -3032,7 +3033,11 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown",
                     await leds_listening(device)
                     await _push_device_state(device)
                     turn_label      = "barge-in"
-                    preroll_discard = esphome.VOICE_PREROLL_DISCARD
+                    # A barge-in the Echo heard itself opened a session
+                    # (_private_barge), which starts after the wake word.
+                    preroll_discard = em_listen.tail_discard(
+                        True, device.listen_session is not None,
+                        esphome.VOICE_PREROLL_DISCARD)
                     # Reset spinner state for the next turn's thinking animation.
                     stop_spin.clear()
                     spin_task = None
