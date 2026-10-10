@@ -370,3 +370,76 @@ func TestTuningCompressorSeesThePlaybackLevel(t *testing.T) {
 		t.Errorf("at -30dB volume it changed by %+.1fdB, want ~0: the driver gets -36dBFS", d)
 	}
 }
+
+// goertzel is the amplitude of one frequency in x.
+func goertzel(x []float64, f float64) float64 {
+	w := 2 * math.Pi * f / 48000
+	coef := 2 * math.Cos(w)
+	var s1, s2 float64
+	for _, v := range x {
+		s := v + coef*s1 - s2
+		s2, s1 = s1, s
+	}
+	p := s1*s1 + s2*s2 - coef*s1*s2
+	return math.Sqrt(math.Max(p, 0)) * 2 / float64(len(x))
+}
+
+// A bass lift with its compressor, at a moderate volume: the treble must not
+// move when the bass comes in. Before ProcessAtLevel the lifted bass sat above
+// full scale and the limiter pulled the treble down with it.
+func TestTunedTrebleDoesNotPumpWithTheBass(t *testing.T) {
+	m, _ := parseMBCL([]byte(testMBCL))
+	spec := &TuningSpec{PEQ: []tuningBiquad{{"LOW_SHELF", 150, 0.9, 20}}, MBCL: m}
+	p := DefaultParams()
+	c := tunedChain(spec, p)
+	gain := dbToGain(-25) // ~60% volume
+
+	treble := func(withBass bool, start int) float64 {
+		var lvl float64
+		for k := 0; k < 6; k++ {
+			l := func(i int) float64 {
+				v := 3000 * math.Sin(2*math.Pi*5000*float64(i)/48000)
+				if withBass {
+					v += 20000 * math.Sin(2*math.Pi*60*float64(i)/48000)
+				}
+				return v
+			}
+			buf := interleave(2048, start+k*2048, l, l)
+			c.ProcessAtLevel(buf, gain, gain)
+			out := channel(buf, 0)
+			x := make([]float64, len(out))
+			for i, s := range out {
+				x[i] = float64(s)
+			}
+			lvl = goertzel(x, 5000)
+		}
+		return lvl
+	}
+	quiet := treble(false, 0)
+	loud := treble(true, 6*2048)
+	if d := 20 * math.Log10(loud/quiet); d < -1 {
+		t.Errorf("5kHz dropped %.1fdB when the bass came in, want under 1dB", -d)
+	}
+}
+
+// Without a tuning, ProcessAtLevel is Process followed by the volume.
+func TestProcessAtLevelIsProcessThenVolume(t *testing.T) {
+	p := DefaultParams()
+	p.GuardEnabled = false
+	a, b := tunedChain(nil, p), tunedChain(nil, p)
+	g := dbToGain(-12)
+	for k := 0; k < 4; k++ {
+		in := monoPeriod(440, 8000, 2048, k*2048)
+		x := append([]byte(nil), in...)
+		y := append([]byte(nil), in...)
+		a.ProcessAtLevel(x, g, g)
+		b.Process(y)
+		scaleS16(y, func(int) float64 { return g })
+		xs, ys := channel(x, 0), channel(y, 0)
+		for i := range xs {
+			if d := int(xs[i]) - int(ys[i]); d > 1 || d < -1 {
+				t.Fatalf("period %d frame %d: %d vs %d", k, i, xs[i], ys[i])
+			}
+		}
+	}
+}

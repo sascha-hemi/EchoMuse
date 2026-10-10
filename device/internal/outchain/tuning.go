@@ -301,13 +301,17 @@ func (t *tuning) firFor(pct int) int {
 
 // process runs the stage over a mono block in place.
 //
-// gain is the playback volume that will be applied after the chain. The
-// compressor-limiter runs on the signal at that level and hands it back at
-// full scale: it is protecting the driver from what the driver will actually
-// get. Run on the full-scale signal instead, it pulled the boosted bass down
-// at every volume, since our volume comes after it (Radar1, 2026-10-10: "the
-// deep bass is still missing"). That the stock chain sets its level the same
-// way is inferred, not read: MBCL.cfg calls its input level "system gain".
+// The compressor-limiter must see the level the driver will get. The chain
+// arranges that with ProcessAtLevel, which applies the volume before this
+// stage, and passes gain 1. gain is the playback level still to come when
+// the signal is at full scale: the compressor then runs at that level and
+// hands the result back at full scale. That second form is kept for the
+// tests; in the chain it put the lifted bass far above full scale, where the
+// final limiter pumped the whole signal with it. Run at full scale with no
+// level at all, the compressor instead pulled the boosted bass down at every
+// volume ("the deep bass is still missing", Radar1, 2026-10-10). That the
+// stock chain levels its compressor like this is inferred, not read: MBCL.cfg
+// calls its input level "system gain".
 func (t *tuning) process(x []float64, volumePct int, gain float64) {
 	if len(t.peq) > 0 {
 		for i, v := range x {

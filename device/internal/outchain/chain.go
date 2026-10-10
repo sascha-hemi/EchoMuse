@@ -113,7 +113,6 @@ type Chain struct {
 	tuningNext atomic.Pointer[tuning]
 	tuning     *tuning
 	volumePct  atomic.Int32
-	volumeGain atomic.Uint64 // float64 bits
 }
 
 // New builds a chain at the given sample rate, inactive, with DefaultParams.
@@ -128,7 +127,6 @@ func New(sampleRate int) *Chain {
 		idle:  true,
 	}
 	c.volumePct.Store(50)
-	c.volumeGain.Store(math.Float64bits(1))
 	c.apply(DefaultParams())
 	return c
 }
@@ -157,10 +155,6 @@ func (c *Chain) SetVolumePercent(pct int) {
 	c.volumePct.Store(int32(pct))
 }
 
-// SetVolumeGain tells the tuning stage the linear playback gain applied
-// after the chain, so its compressor works at the level the speaker gets.
-func (c *Chain) SetVolumeGain(g float64) { c.volumeGain.Store(math.Float64bits(g)) }
-
 // tuned runs the tuning stage over a mono block when it applies, and returns
 // nil when it does not (no tuning, disabled, or stereo).
 func (c *Chain) tuned(n int, sample func(i int) float64) []float64 {
@@ -172,7 +166,7 @@ func (c *Chain) tuned(n int, sample func(i int) float64) []float64 {
 	for i := range blk {
 		blk[i] = sample(i)
 	}
-	t.process(blk, int(c.volumePct.Load()), math.Float64frombits(c.volumeGain.Load()))
+	t.process(blk, int(c.volumePct.Load()), 1)
 	return blk
 }
 
@@ -231,9 +225,50 @@ func (c *Chain) Idle() bool {
 // The first return is non-nil only when a queued SetParams changed the chain
 // on this period, so the caller can log what the audio is now going through.
 func (c *Chain) Process(buf []byte) (applied *Params) {
+	return c.process(buf, nil)
+}
+
+// ProcessAtLevel is Process with the playback volume applied FIRST, ramped
+// from g0 to g1 across the period the way the speaker's volume stage ramps,
+// so everything after it runs at the level the speaker gets. The caller then
+// applies no volume of its own.
+//
+// It exists for the speaker tuning: the tuning lifts the bass by up to ~20dB
+// and its compressor keeps that within what the driver takes AT THE PLAYBACK
+// LEVEL. Processed at full scale with the volume after, the lifted bass sat
+// far above full scale, and the limiter pulled the whole signal down on every
+// bass note — the treble pumped with the bass (Radar1, 2026-10-10).
+func (c *Chain) ProcessAtLevel(buf []byte, g0, g1 float64) (applied *Params) {
+	frames := len(buf) / 4
+	if frames == 0 {
+		return c.process(buf, nil)
+	}
+	step := (g1 - g0) / float64(frames)
+	return c.process(buf, func(i int) float64 { return g0 + step*float64(i+1) })
+}
+
+// TuningOn reports whether the speaker tuning would run on mono audio now.
+// ALSA goroutine only, like Process.
+func (c *Chain) TuningOn() bool {
+	t := c.tuning
+	if n := c.tuningNext.Load(); n != nil {
+		t = n
+	}
+	return t != nil && (t.fir != nil || t.mbcl != nil || len(t.peq) > 0) &&
+		c.params.SpeakerTuning && c.active.Load()
+}
+
+func (c *Chain) process(buf []byte, gain func(i int) float64) (applied *Params) {
 	applied, active := c.beginProcess()
 	if !active {
+		if gain != nil {
+			scaleS16(buf, gain)
+		}
 		return applied
+	}
+	g := gain
+	if g == nil {
+		g = func(int) float64 { return 1 }
 	}
 
 	if !c.stereo && !dualMono(buf) {
@@ -245,7 +280,7 @@ func (c *Chain) Process(buf []byte) (applied *Params) {
 		off := i * 4
 		l := int16(uint16(buf[off]) | uint16(buf[off+1])<<8)
 		r := int16(uint16(buf[off+2]) | uint16(buf[off+3])<<8)
-		return (float64(l) + float64(r)) / 2
+		return (float64(l) + float64(r)) / 2 * g(i)
 	})
 	silentIn, silentOut := true, true
 	for i := 0; i < frames; i++ {
@@ -257,7 +292,8 @@ func (c *Chain) Process(buf []byte) (applied *Params) {
 		}
 
 		if c.stereo {
-			xl, xr := c.eq.step(float64(l)), c.eqR.step(float64(r))
+			gi := g(i)
+			xl, xr := c.eq.step(float64(l)*gi), c.eqR.step(float64(r)*gi)
 			xl, xr = c.guard.stepStereo(xl, xr)
 			xl, xr = c.lim.stepStereo(xl, xr)
 			sl, sr := toS16(xl), toS16(xr)
@@ -269,7 +305,7 @@ func (c *Chain) Process(buf []byte) (applied *Params) {
 			continue
 		}
 
-		x := (float64(l) + float64(r)) / 2
+		x := (float64(l) + float64(r)) / 2 * g(i)
 		if tuned != nil {
 			x = tuned[i]
 		}
@@ -402,6 +438,20 @@ func (c *Chain) beginProcess() (applied *Params, active bool) {
 		c.running = active
 	}
 	return applied, active
+}
+
+// scaleS16 multiplies a stereo S16_LE period by a per-frame gain, rounding as
+// the speaker's volume stage does.
+func scaleS16(buf []byte, gain func(i int) float64) {
+	for i := 0; i < len(buf)/4; i++ {
+		g := gain(i)
+		for ch := 0; ch < 2; ch++ {
+			off := i*4 + ch*2
+			s := math.Round(float64(int16(uint16(buf[off])|uint16(buf[off+1])<<8)) * g)
+			v := toS16(s)
+			buf[off], buf[off+1] = byte(uint16(v)), byte(uint16(v)>>8)
+		}
+	}
 }
 
 // toS16 is the backstop, then truncation toward zero —

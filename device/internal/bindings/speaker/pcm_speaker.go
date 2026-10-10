@@ -614,7 +614,16 @@ func (p *PcmSpeaker) silenceLoop() {
 					out, process = p.chainBuf, true
 				}
 			}
-			if process {
+			if process && p.chain.TuningOn() {
+				// The speaker tuning runs at the playback level: the chain
+				// applies the volume, ramped as p.vol would have (chain.go,
+				// ProcessAtLevel).
+				tgt := p.vol.targetGain()
+				if applied := p.chain.ProcessAtLevel(out, p.vol.cur, tgt); applied != nil {
+					log.Printf("[speaker] output chain: %s", applied)
+				}
+				p.vol.cur = tgt
+			} else if process {
 				if applied := p.chain.Process(out); applied != nil {
 					log.Printf("[speaker] output chain: %s", applied)
 				}
@@ -861,7 +870,6 @@ func (p *PcmSpeaker) SetVolume(level int) {
 	// The speaker tuning's FIR is chosen by volume, and its compressor works
 	// at the level the speaker gets (Radar).
 	p.chain.SetVolumePercent(level * 100 / 127)
-	p.chain.SetVolumeGain(VolumeGain(level))
 }
 
 // SetResponseGainDB sets the gain applied only to the voice plane, before it is
