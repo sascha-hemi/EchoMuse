@@ -18,6 +18,11 @@ type Params struct {
 	LimiterEnabled     bool
 	LimiterThresholdDb float64
 	LimiterReleaseMs   float64
+	// SpeakerTuning allows the device's speaker tuning stage (tuning.go) to
+	// run when one is loaded. Not a controller setting: the device clears it
+	// while a plug is in the jack, because the tuning is for the internal
+	// speaker.
+	SpeakerTuning bool
 }
 
 // DefaultParams mirrors the controller's defaults, so a device that has not
@@ -29,6 +34,7 @@ func DefaultParams() Params {
 		LimiterEnabled:     true,
 		LimiterThresholdDb: -1,
 		LimiterReleaseMs:   150,
+		SpeakerTuning:      true,
 	}
 }
 
@@ -101,6 +107,12 @@ type Chain struct {
 	idle    bool // state is all zero and input is silence
 	running bool // active on the previous period
 	stereo  bool // processing L and R apart, since a period differed
+
+	// The speaker tuning stage, when the device has one (SetTuning), and the
+	// volume that picks its FIR (SetVolumePercent).
+	tuningNext atomic.Pointer[tuning]
+	tuning     *tuning
+	volumePct  atomic.Int32
 }
 
 // New builds a chain at the given sample rate, inactive, with DefaultParams.
@@ -114,8 +126,48 @@ func New(sampleRate int) *Chain {
 		lim:   newLimiter(fs),
 		idle:  true,
 	}
+	c.volumePct.Store(50)
 	c.apply(DefaultParams())
 	return c
+}
+
+// SetTuning installs the speaker tuning stage. It runs ahead of the EQ, on mono
+// audio only, while Params.SpeakerTuning is set; while it runs, the bass
+// guard is skipped, because the tuning's own multi-band compressor is what
+// protects the driver from the bass the tuning adds. A nil or empty spec
+// removes it. Takes effect at the next period.
+func (c *Chain) SetTuning(s *TuningSpec) {
+	if s.Empty() {
+		c.tuningNext.Store(&tuning{})
+		return
+	}
+	c.tuningNext.Store(newTuning(s, c.fs))
+}
+
+// SetVolumePercent tells the tuning stage the device volume, 0-100, which
+// picks its FIR.
+func (c *Chain) SetVolumePercent(pct int) {
+	if pct < 0 {
+		pct = 0
+	} else if pct > 100 {
+		pct = 100
+	}
+	c.volumePct.Store(int32(pct))
+}
+
+// tuned runs the tuning stage over a mono block when it applies, and returns
+// nil when it does not (no tuning, disabled, or stereo).
+func (c *Chain) tuned(n int, sample func(i int) float64) []float64 {
+	t := c.tuning
+	if t == nil || (t.fir == nil && t.mbcl == nil && len(t.peq) == 0) || !c.params.SpeakerTuning || c.stereo {
+		return nil
+	}
+	blk := t.block(n)
+	for i := range blk {
+		blk[i] = sample(i)
+	}
+	t.process(blk, int(c.volumePct.Load()))
+	return blk
 }
 
 // SetActive turns processing on or off. Off is a passthrough, which is what
@@ -183,6 +235,12 @@ func (c *Chain) Process(buf []byte) (applied *Params) {
 	}
 
 	frames := len(buf) / 4
+	tuned := c.tuned(frames, func(i int) float64 {
+		off := i * 4
+		l := int16(uint16(buf[off]) | uint16(buf[off+1])<<8)
+		r := int16(uint16(buf[off+2]) | uint16(buf[off+3])<<8)
+		return (float64(l) + float64(r)) / 2
+	})
 	silentIn, silentOut := true, true
 	for i := 0; i < frames; i++ {
 		off := i * 4
@@ -206,9 +264,14 @@ func (c *Chain) Process(buf []byte) (applied *Params) {
 		}
 
 		x := (float64(l) + float64(r)) / 2
+		if tuned != nil {
+			x = tuned[i]
+		}
 
 		x = c.eq.step(x)
-		x = c.guard.step(x)
+		if tuned == nil {
+			x = c.guard.step(x)
+		}
 		x = c.lim.step(x)
 
 		s := toS16(x)
@@ -254,6 +317,13 @@ func (c *Chain) ProcessFloat(buf []float64, fullScales []float64) (applied *Para
 	}
 
 	frames := len(buf) / 2
+	tuned := c.tuned(frames, func(i int) float64 {
+		scale := 1.0
+		if i < len(fullScales) && fullScales[i] > 0 {
+			scale = fullScales[i]
+		}
+		return (buf[i*2] + buf[i*2+1]) / (2 * scale)
+	})
 	silentIn, silentOut := true, true
 	for i := 0; i < frames; i++ {
 		l, r := buf[i*2], buf[i*2+1]
@@ -278,8 +348,13 @@ func (c *Chain) ProcessFloat(buf []float64, fullScales []float64) (applied *Para
 		}
 
 		x := (l + r) / (2 * scale)
+		if tuned != nil {
+			x = tuned[i]
+		}
 		x = c.eq.step(x)
-		x = c.guard.step(x)
+		if tuned == nil {
+			x = c.guard.step(x)
+		}
 		x = c.lim.step(x)
 		x = clampS16(x) * scale
 		if math.Abs(x) >= 1 {
@@ -309,6 +384,9 @@ func (c *Chain) goStereo() {
 func (c *Chain) beginProcess() (applied *Params, active bool) {
 	if p, changed := c.takePending(); changed {
 		applied = &p
+	}
+	if t := c.tuningNext.Swap(nil); t != nil {
+		c.tuning = t
 	}
 	active = c.active.Load()
 	if active != c.running {
@@ -358,6 +436,9 @@ func dualMonoFloat(buf []float64) bool {
 }
 
 func (c *Chain) reset() {
+	if c.tuning != nil {
+		c.tuning.reset()
+	}
 	c.eq.reset()
 	c.eqR.reset()
 	c.stereo = false

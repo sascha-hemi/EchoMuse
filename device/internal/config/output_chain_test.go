@@ -27,6 +27,8 @@ func TestOutputChainKeysApplyIncludingZero(t *testing.T) {
 		Bands: [8]float64{1, 2, 3, 4, 5, 6, 7, 8}, Loudness: true,
 		GuardEnabled: false, GuardDb: -12,
 		LimiterEnabled: false, LimiterThresholdDb: -3, LimiterReleaseMs: 80,
+		// Not a controller key: it keeps the default the first push loads.
+		SpeakerTuning: true,
 	}
 	if got := d.OutputChain(); got != want {
 		t.Fatalf("got %+v\nwant %+v", got, want)

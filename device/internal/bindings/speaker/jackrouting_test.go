@@ -179,8 +179,12 @@ func TestChainForJackBypassesOnlyTheGuardWithAPlugIn(t *testing.T) {
 	if got.GuardEnabled {
 		t.Errorf("guard must be bypassed with a plug in")
 	}
+	if got.SpeakerTuning {
+		t.Errorf("the speaker tuning must not run on the line out")
+	}
 	want := in
 	want.GuardEnabled = false
+	want.SpeakerTuning = false
 	if got != want {
 		t.Errorf("only GuardEnabled may change:\n got %+v\nwant %+v", got, want)
 	}

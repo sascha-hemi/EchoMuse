@@ -320,6 +320,7 @@ func (p *PcmSpeaker) Init() (err error) {
 			return err
 		}
 		p.radarSpeakerBiquad, p.radarJackBiquad = loadRadarJackProfiles(radarDeviceXML)
+		p.loadRadarTuning()
 	}
 	// Connect the DAC to the output mixer before opening the stream: DAPM
 	// decides what to power at stream open, and an unrouted DAC is powered
@@ -855,7 +856,11 @@ const dacUnity = "127"
 
 // SetVolume sets the playback volume as a device level (0..127, 0.5dB per
 // step, unity at 127). Takes effect from the next period, ramped across it.
-func (p *PcmSpeaker) SetVolume(level int) { p.vol.set(VolumeGain(level)) }
+func (p *PcmSpeaker) SetVolume(level int) {
+	p.vol.set(VolumeGain(level))
+	// The speaker tuning's FIR is chosen by volume (Radar).
+	p.chain.SetVolumePercent(level * 100 / 127)
+}
 
 // SetResponseGainDB sets the gain applied only to the voice plane, before it is
 // mixed with music. It is relative to the device volume and dynamically capped
