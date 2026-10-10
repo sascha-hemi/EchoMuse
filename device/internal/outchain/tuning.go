@@ -300,7 +300,15 @@ func (t *tuning) firFor(pct int) int {
 }
 
 // process runs the stage over a mono block in place.
-func (t *tuning) process(x []float64, volumePct int) {
+//
+// gain is the playback volume that will be applied after the chain. The
+// compressor-limiter runs on the signal at that level and hands it back at
+// full scale: it is protecting the driver from what the driver will actually
+// get. Run on the full-scale signal instead, it pulled the boosted bass down
+// at every volume, since our volume comes after it (Radar1, 2026-10-10: "the
+// deep bass is still missing"). That the stock chain sets its level the same
+// way is inferred, not read: MBCL.cfg calls its input level "system gain".
+func (t *tuning) process(x []float64, volumePct int, gain float64) {
 	if len(t.peq) > 0 {
 		for i, v := range x {
 			for k := range t.peq {
@@ -313,8 +321,11 @@ func (t *tuning) process(x []float64, volumePct int) {
 		t.fir.process(x, t.firFor(volumePct))
 	}
 	if t.mbcl != nil {
+		if gain < 1e-6 || gain > 1 {
+			gain = 1 // muted: nothing will be heard, so do not divide by it
+		}
 		for i, v := range x {
-			x[i] = t.mbcl.step(v)
+			x[i] = t.mbcl.step(v*gain) / gain
 		}
 	}
 }

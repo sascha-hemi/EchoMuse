@@ -113,6 +113,7 @@ type Chain struct {
 	tuningNext atomic.Pointer[tuning]
 	tuning     *tuning
 	volumePct  atomic.Int32
+	volumeGain atomic.Uint64 // float64 bits
 }
 
 // New builds a chain at the given sample rate, inactive, with DefaultParams.
@@ -127,6 +128,7 @@ func New(sampleRate int) *Chain {
 		idle:  true,
 	}
 	c.volumePct.Store(50)
+	c.volumeGain.Store(math.Float64bits(1))
 	c.apply(DefaultParams())
 	return c
 }
@@ -155,6 +157,10 @@ func (c *Chain) SetVolumePercent(pct int) {
 	c.volumePct.Store(int32(pct))
 }
 
+// SetVolumeGain tells the tuning stage the linear playback gain applied
+// after the chain, so its compressor works at the level the speaker gets.
+func (c *Chain) SetVolumeGain(g float64) { c.volumeGain.Store(math.Float64bits(g)) }
+
 // tuned runs the tuning stage over a mono block when it applies, and returns
 // nil when it does not (no tuning, disabled, or stereo).
 func (c *Chain) tuned(n int, sample func(i int) float64) []float64 {
@@ -166,7 +172,7 @@ func (c *Chain) tuned(n int, sample func(i int) float64) []float64 {
 	for i := range blk {
 		blk[i] = sample(i)
 	}
-	t.process(blk, int(c.volumePct.Load()))
+	t.process(blk, int(c.volumePct.Load()), math.Float64frombits(c.volumeGain.Load()))
 	return blk
 }
 

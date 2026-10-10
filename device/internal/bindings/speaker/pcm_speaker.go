@@ -858,8 +858,10 @@ const dacUnity = "127"
 // step, unity at 127). Takes effect from the next period, ramped across it.
 func (p *PcmSpeaker) SetVolume(level int) {
 	p.vol.set(VolumeGain(level))
-	// The speaker tuning's FIR is chosen by volume (Radar).
+	// The speaker tuning's FIR is chosen by volume, and its compressor works
+	// at the level the speaker gets (Radar).
 	p.chain.SetVolumePercent(level * 100 / 127)
+	p.chain.SetVolumeGain(VolumeGain(level))
 }
 
 // SetResponseGainDB sets the gain applied only to the voice plane, before it is

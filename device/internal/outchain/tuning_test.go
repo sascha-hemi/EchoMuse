@@ -349,3 +349,24 @@ func TestChainSkipsTheGuardWhileTheTuningRuns(t *testing.T) {
 		t.Errorf("guard reduced %.2fdB while the tuning ran, want 0", r)
 	}
 }
+
+// The compressor works at the playback level: loud bass that it pulls down at
+// full volume passes untouched at a low one, back at full scale for the
+// volume stage after the chain.
+func TestTuningCompressorSeesThePlaybackLevel(t *testing.T) {
+	m, _ := parseMBCL([]byte(testMBCL))
+	spec := &TuningSpec{MBCL: m}
+	in := sine(40, fullScale*0.5, 48000) // -6 dBFS
+	run := func(gain float64) float64 {
+		tn := newTuning(spec, 48000)
+		x := append([]float64(nil), in...)
+		tn.process(x, 50, gain)
+		return 20 * math.Log10(rms(x[24000:])/rms(in[24000:]))
+	}
+	if d := run(1); d > -3 {
+		t.Errorf("at full volume 40Hz at -6dBFS changed by %+.1fdB, want it compressed", d)
+	}
+	if d := run(dbToGain(-30)); math.Abs(d) > 0.5 {
+		t.Errorf("at -30dB volume it changed by %+.1fdB, want ~0: the driver gets -36dBFS", d)
+	}
+}
