@@ -452,8 +452,9 @@ func main() {
 	go jack.Watch(ctx, func(inserted bool) {
 		pcmSpeaker.SetJackRouting(inserted)
 		// Sendspin asks for stereo while a plug is in (#273).
+		// Not on a board whose jack is mono (Radar).
 		if c := sendspinPlayer(); c != nil {
-			c.SetStereo(inserted)
+			c.SetStereo(inserted && pcmSpeaker.JackCarriesStereo())
 		}
 	})
 	// Android's audio HAL rewrites the codec on every mediaserver restart —

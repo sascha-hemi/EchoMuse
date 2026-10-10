@@ -122,7 +122,7 @@ func applySendspinConfig(spk *speaker.PcmSpeaker, cc *client.ControlClient, vol 
 			c.SetVolume(levelToPct(vol.VolumeLevel()))
 			// Before Start too: the first client/hello lists formats in
 			// the order the plug position prefers (#273).
-			c.SetStereo(jack.Inserted())
+			c.SetStereo(jack.Inserted() && spk.JackCarriesStereo())
 			// Open before Start advertises: Music Assistant dials when the
 			// record appears and may not retry a timeout. Logged, not
 			// fatal: FireOS has no filter to open.
