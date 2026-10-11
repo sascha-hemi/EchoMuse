@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"math"
 	"testing"
+	"time"
 )
 
 // synth generates deterministic voice-band-ish noise at 16kHz mono.
@@ -330,6 +331,29 @@ func TestHardwareRefIgnoresWriteFar(t *testing.T) {
 	if c.count != 0 {
 		t.Fatalf("WriteFar filled the ring on the hardware path: %d samples", c.count)
 	}
+}
+
+// TestWriteFarDoesNotWaitOnHardwareRef: on the hardware path WriteFar runs
+// on the speaker's write loop and must not wait for the canceller's lock,
+// which the mic side holds through a whole block of cancellation (#866).
+func TestWriteFarDoesNotWaitOnHardwareRef(t *testing.T) {
+	c := New()
+	c.SetParams(true, 0, 200)
+	c.SetHardwareRef(true)
+
+	c.mu.Lock() // the mic side, mid-block
+	done := make(chan struct{})
+	go func() {
+		c.WriteFar(to48kStereo(synth(FrameSize)))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		c.mu.Unlock()
+		t.Fatal("WriteFar waited for the canceller's lock on the hardware path")
+	}
+	c.mu.Unlock()
 }
 
 // TestMissingHardwareRefPassesThrough — a caller that promises a hardware
