@@ -27,12 +27,18 @@ const periodSize = 2048
 // The hardware tier: what ALSA holds ahead of the DAC. It is sized ONLY for
 // this loop's scheduling lateness — WiFi is the deep queue's job — and every
 // frame of it is latency a duck cannot touch, since ducking happens as audio
-// leaves the deep queue. It was 4 x 2048 (171ms). Measured on VVV 2026-09-22
-// under music, wake scoring, the output chain and turns: the loop was never
-// more than 19ms late (worst gap 61.7ms against a 42.7ms period). 4 x 1024 is
-// 85ms. Each mixed period is written as two halves, so the mix cadence, the
-// stream units and the wire are all unchanged.
-const alsaPeriodSize = 1024
+// leaves the deep queue.
+//
+// 4 x 2048 (171ms). It was cut to 4 x 1024 (85ms) on 2026-09-22, after the
+// loop was measured never more than 19ms late on VVV (worst gap 61.7ms
+// against a 42.7ms period). The same worst gaps (51-62ms) still underflowed
+// it: on a Radar, 2026-10-11, the kernel logged mtk_pcm_I2S0dl1_pointer
+// underflow and the stream restarted (an audible dropout) five times in
+// ~13 minutes of music, in minutes whose worst gap was well under 85ms.
+// The usable margin is smaller than the ring; why is not established. On
+// 4 x 2048, 9 minutes with gaps up to 66.5ms and no underflow. 6 x 1024 is
+// refused by the Radar's driver (cannot prepare channel).
+const alsaPeriodSize = 2048
 const alsaPeriodCount = 4
 const alsaBufferFrames = alsaPeriodSize * alsaPeriodCount
 const periodBytes = periodSize * 2 * 2 // 2 channels * 2 bytes = 8192
@@ -765,7 +771,7 @@ func (p *PcmSpeaker) EndMusicStream() { p.music.endStream() }
 //     ~1.3s skip). The controller sends the EOS on the cancel path too, so
 //     the discard always terminates.
 //
-// Up to alsaBufferFrames (~85ms) already handed to the hardware
+// Up to alsaBufferFrames (~171ms) already handed to the hardware
 // still play — cutting those needs a stream restart, which costs more in
 // click/pop than it saves.
 func (p *PcmSpeaker) Flush() { p.voice.flush() }
