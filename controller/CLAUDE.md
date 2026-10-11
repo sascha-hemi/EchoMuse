@@ -490,6 +490,28 @@ by the vendored protobuf and read by nothing. Four rules:
   the device on the 30s TTS wait and recorded a timeout. The flag is derived
   from the trace's own trigger label so it cannot disagree with the stats, and
   the outcome is `answered`, not `no_tts`: the transcript IS the deliverable.
+- **The wake-tail discard is for a stream the controller scored, never for a
+  session** (#829, `em_listen.tail_discard`). `VOICE_PREROLL_DISCARD` drops
+  240ms from the start of a wake turn to keep the end of the wake word out of
+  the transcript. An Echo that detects its own wake word starts the session
+  AFTER the frame that crossed (docs/listening.md), and reports the wake once
+  the word has finished, so on a session the 240ms was the command: "hey
+  Verona tell me a joke" in one breath reached STT as "me a joke". Measured
+  2026-10-09: four run-on recordings began mid-speech at 0-80ms; with the
+  discard off, 14 commands (run-on, paused and barge-in) kept their first word
+  and none gained a tail. A barge-in the Echo heard opens a session too and is
+  treated the same. The timer-dismiss listener keeps its skip: there the tail
+  must not count as speech.
+- **The reply wait is `tts_wait_timeout` / `EM_TTS_WAIT_TIMEOUT`** (#811,
+  default 30s, clamped to `em_turnclock.TTS_WAIT_MAX` 120s, parsed in
+  `em_turnclock` so a typo cannot stop the import). It is a stop-gap. A Voice
+  PE has NO timer on this wait (ESPHome `voice_assistant.cpp`, state
+  AWAITING_RESPONSE, read 2026-10-09): it leaves only on HA's TTS start,
+  run end or error, or the user stopping it. #830 is the aligned behaviour,
+  with this option as the dead-man. Two things it must carry: HA sends
+  nothing between `intent-start` and `intent-end` during a long tool-using
+  think, so progress cannot be the heartbeat; and `em_scenes.SPIN_TTL` (135s)
+  covers the wait PLUS the TTS fetch, so at a 120s wait the ring has 15s left.
 - **A muted device runs the turn anyway, and that is deliberate.**
   `async_internal_ask_question` awaits its answer future with **no timeout**, so
   a satellite that refuses by staying silent hangs the caller's script for good.
@@ -513,13 +535,62 @@ playing nothing. With two devices it reads as a routing fault, because the
 other device is fine. An announcement is a new action and nothing that set that
 flag earlier has a claim on it.
 
-**`VoiceAssistantSetConfiguration` is handled but not applied.** It is HA
-writing a wake-word choice back to us. We advertise one model with
-`max_active_wake_words=1`, so the dropdown offers our model plus "no wake
-word" and there is nothing to switch between; an empty list means "deafen
-this satellite", which is a real request we do not implement and log at
-warning rather than drop. Applying it, and offering a choice worth making,
-both wait on #112.
+**`VoiceAssistantSetConfiguration` turns the wake word off and on (#286,
+#552).** We advertise one model with `max_active_wake_words=1`, so HA's
+picker is an on/off per Echo: "No wake word" is off, our model is on; WHICH
+model stays a dashboard setting (#112). HA sends the union of its two
+pickers, reads the config back straight after writing it (so state is set
+before the handler returns), and never re-sends its restored choice, so the
+controller stores it per device in `system_config` (`em_db.get_wake_word_enabled`)
+rather than in device config, where a dashboard save would write a stale
+copy back. The policy is `em_wakeword.py`; the mic mute button and the
+picker never move each other.
+
+**Off has to reach the Echo when it listens privately.** It detects its own
+wake word and opens a session before the controller can close it, so firmware
+announcing `wake_word_off` gets `wakeWordEnabled` (a pointer; false is the
+value that matters) on connect and on every change, and stops at the crossing.
+Older firmware reporting `listen_state=local` has off DECLINED
+(`em_wakeword.decline_off`) and HA's re-read snaps the picker back: accepting
+it would show "No wake word" while each wake still sent up to 3s of audio.
+An Echo streaming to the controller is stopped with `mic_stop`. The
+`listen_close(wake_off)` in `_private_wake_turn` stays as a backstop for the
+moment between boot and the first push.
+
+**Off is the same in both listening modes, and `em_wakeword` is where that is
+held** (Wil, 2026-10-05, #778: "the two options must be functionally
+identical"). #552 was run on hardware only with the wake word on the Echo.
+Three things followed, all from running the other mode:
+
+- `wake_allowed` is asked for wakes AND barges, and takes no argument for
+  where the wake word is detected, so the modes cannot branch on it. The Echo
+  applies the same rule itself at `onWakeCrossing`, before a session can open.
+  The barge check on the controller is a safeguard only: with the wake word
+  off every turn is started by HA or the button on a bounded turn stream that
+  ends at end of speech, so the barge watcher has no audio to score.
+- A follow-up takes a turn stream whenever there is no wake stream to reuse
+  (`follow_up_needs_turn_stream`): a private Echo, or one scored here with the
+  wake word off. Before, the controller-scored follow-up reused a stream that
+  was down, through a `mic_start` that is skipped while off, and ended
+  `no_speech`.
+- **Nothing streams while off**, and `_stream_listen` enforces it
+  (`stray_stream`): audio arriving unmuted with the wake word off gets a
+  `mic_stop`, at most once per 2s. A private Echo restarts its own local
+  stream after a turn that ended itself (`turnEndedItself`), harmless there;
+  switched to "On the controller" it became a network stream nobody stopped,
+  31s on 15LE, with the controller silently dropping the frames.
+
+**A stored off is not revisited when firmware goes backwards (#776).** An Echo
+stored as off that reconnects on firmware without `wake_word_off` still opens
+a session per wake, closed by the `listen_close(wake_off)` backstop. Clearing
+it needs HA's connection bounced too, since HA does not re-read the picker on
+its own.
+
+**Announcements show the playback meter (#780).** `_standalone_play` raises
+the same `meter_anim` a reply gets, for the clip's known length, and clears it
+after; not while a voice turn or a ringing timer owns the ring
+(`em_scenes.announcement_ring`). Until then the opening message of a
+`start_conversation` played with the ring dark.
 
 ### HA entities beyond the voice satellite
 
@@ -646,6 +717,21 @@ Two guards sit in front of that, both tested by reintroducing the bug:
   as odd behaviour elsewhere, exactly when someone has rolled an image back
   and is already troubleshooting.
 
+**The image defaults `DB_PATH` to the mounted folder (#785).** The code's
+default is the relative `echomuse.db`, which in the image is `/app`, outside
+the `./data:/app/data` volume: with no `.env`, the database, the device-link
+CA (`em_pki` derives its directory from DB_PATH's parent) and the recordings
+were lost on every recreate. The Dockerfile now sets
+`DB_PATH=/app/data/echomuse.db` and creates the directory. A warning banner
+for the unset case was declined (#755): the fix removes the fault.
+
+**mDNS is advertised on SERVER_IP's interface alone (#604).** zeroconf's
+default opens a socket per host interface, and a send failing on one mDNS
+never needed stalled the event loop. Both responders are built by
+`em_hostip.bind_mdns`, which falls back to every interface, with a warning,
+when SERVER_IP is not an address on the host (zeroconf raises OSError ENODEV
+or ValueError at construction).
+
 ## Controller audio pipeline
 
 1. **Wake word** — **two paths, chosen per Echo from its own `listen_state`** (docs/listening.md). `wake_word_listener` dispatches to `_private_listen` for an Echo listening privately (it detects its own wake word and sends a `0x07` session only after it) and to `_stream_listen` otherwise, and each returns when the Echo moves to the other. Rules for the private path:
@@ -656,7 +742,7 @@ Two guards sit in front of that, both tested by reintroducing the bug:
     - **Follow-up questions use the bounded turn stream** (`mic_stop` + `mic_start_turn`), exactly as the button does — there is no controller-opened session.
     - **Controller-only measurements are absent, not zero**: `ctrl_wake_score` is not recorded (and no "controller MISS" is logged), `owwNearMisses` is null, `noise_floor` comes from the Echo's `floor` on each wake.
 
-    On the stream path, openwakeword (ONNX) runs in a thread executor per device on `mic_queue`. When 2+ devices are connected, `em_arbiter.py` applies **first-detector-wins** suppression: the first device to HEAR the wake answers *immediately* (no added latency, the claim is synchronous; each claim carries its capture time, arrival − device-reported age − half the smoothed RTT, so a late message cannot turn a near Echo's wake into a second answer) and any other device detecting within `wakeArbitrationMs` (default 700, 0 = off) stands down and logs "Wake ceded". **Except on a mixed fleet** (some Echoes detecting on the device, some scored here — `em_listen.arbitration_hold`): there the paths reach the arbiter at different speeds, so `em_arbiter.contest` holds the claim until `MIXED_HOLD_S` (250ms) after it was heard and grants the one heard EARLIEST (Wil, 2026-09-24, after an Echo 10m away took a barge-in from one a metre away by 16ms). A uniform fleet never waits. The claim is released at turn end. Do NOT reinstate the original best-SNR-after-a-wait design: it taxed every wake ~364ms (it gated on devices *connected*, not in earshot) and field data showed SNR at detection was indistinguishable across devices (0.9/1.15/0.93) while the SNR winner produced a worse transcript than the first detector.
+    On the stream path, openwakeword (ONNX) runs in a thread executor per device on `mic_queue`. When 2+ Echoes can claim, `em_arbiter.py` holds the first claim until `ARB_HOLD_S` (250ms) after it was HEARD, collects every claim heard within `wakeArbitrationMs` (default 700, 0 = off), and `pick()` chooses **the loudest, with no margin** (Wil, 2026-10-05 and 10-06, #747): what has to be right is the room, between rooms the lead is 10dB or more, and inside one room nobody minds which Echo answers. Time was measured as noise on 2026-10-06 (one word, three Echoes side by side, reported 89-224ms apart) and decides only when levels cannot be compared. Each claim carries its capture time (arrival − device-reported age − half the smoothed RTT) and the wake's averaged level from `em_wakelevel` (post-AEC, AGC never on the wake stream, mic gain divided out). Losers stand down and log "Wake ceded"; the claim is released at turn end. Loudness decides only when it can be trusted: the contest falls back to earliest-heard when a level is missing (older firmware), when any claim was heard over that Echo's own playback (every barge-in), or when MICPGA/digital gain differ between the Echoes, because those are still inside the reading. **Why time alone was not enough:** the scorer works in 80ms frames, so at close range hearing order is frame alignment; in #747's twelve contested wakes the nearest Echo heard the word 54–164ms AFTER the winner in four, and was 11–26dB louder than every other in all twelve. **History, so it is not undone by reflex:** until 2026-07-20 this waited ~364ms on every wake and ranked by SNR at detection, which could not tell Echoes apart (0.9/1.15/0.93) and picked a worse transcript; first-detector-wins replaced it with no wait. On 2026-09-24 a MIXED fleet got a 250ms hold granting the earliest heard, after an Echo 10m away took a barge-in from one a metre away by 16ms of arrival. The present rule is not the SNR design back again: it measures a quantity that separates Echoes by 11dB or more and keeps time as the answer whenever it does not. **Not handled:** a weak microphone reads quiet and loses to a louder Echo further away; the fix is the per-Echo check against its other six mics (#731), not a wider margin. The 6dB margin and whether to trust a reading taken over playback are unmeasured on our own Echoes as of 2026-10-05.
 
     **A device with no HA behind it stands down BEFORE arbitration, and never runs the turn at all** (`em_esphome.can_serve_turn`, the same `get_server`/`get_satellite` pair `trigger_voice_turn` refuses on, so a device counted as able cannot turn out to be unable a tick later). Detection order is a **proximity** proxy and says nothing about whether HA has ever dialled that device's satellite port, so unqualified first-detector-wins hands the utterance to an unlinked Echo, stands down the linked one, and the winner then dies `no_ha` in milliseconds: nothing answers, and the device that could have is the one that went dark. Measured on the fleet 2026-08-29 — a device scoring **0.912** lost to one scoring 0.609 that crossed 449ms earlier, so loudness and detection order do genuinely disagree; that is one observation and not a case for reopening best-SNR, which stays settled. The ordering is the guard: a check after the claim leaves the claim taken, and `tests/test_deploy.py` pins that `can_serve_turn` precedes the claim (`_claim_wake`) and gates it. `em_arbiter` deliberately does **not** know about any of this — a second copy of the rule is one that can disagree with the first.
 
@@ -1009,22 +1095,56 @@ went **permanently deaf** after a mid-chime dismissal. Roughly three dismissals
 in four hit it, the chime being 1.68s of every 2.3s.
 
 **HA hands ringing to the satellite and expects the satellite to own dismissal**
-— the same shape its own Voice PE hardware has. So the dismissal is recognised
-here, from the transcript HA already sends, rather than waiting for a CANCELLED
-that structurally will not come. The registry's CANCELLED path stays for the
-cases HA *does* answer.
+— the same shape its own Voice PE hardware has. The registry's CANCELLED path
+stays for the cases HA *does* answer.
 
-**Two dismissal matchers, and they must not be collapsed into one.**
-`is_dismissal` is deliberately generous, because a missed dismissal leaves the
-alarm ringing and HA answering "there are no timers", which is far worse than
-an extra stop. `is_dismissal_only` is strict, because it suppresses HA's reply
-— and a false positive there is not a spare stop, it is a **lost answer**.
-"Turn off the kitchen light" over a ringing alarm is a dismissal by the
-generous rule (correctly — the alarm should stop) and also a real command HA
-answers; suppressing that left the light off and the user unable to tell
-whether anything had happened. Note it is the `off` variant that breaks, not
-`on`. Phrases are stripped **longest-first** so `turn off` is consumed before
-the bare `off` strands `turn` as an unexplained word.
+**By voice, a ringing timer stops on the wake word followed by anything
+spoken** (Wil, 2026-10-04; `em_timers.DismissListen`,
+`em_controller._dismiss_by_speech`). The wake holds every ringing alarm in the
+fleet silent (`_hold_alarms`: a flush, and a DEADLINE on
+`timer_alarm_hold_t`, never a flag, so a wake that goes nowhere cannot leave
+an alarm silent); `_run_voice_locked` then runs the dismissal listen INSTEAD
+of a turn, scoring the session's frames with the speech gate's Silero for
+`DISMISS_LISTEN_S`. Two consecutive speech frames after the preroll stop the
+ring everywhere; silence releases the hold and the ring resumes. Nothing
+reaches Home Assistant. Three things to keep:
+
+- **It asks whether someone spoke, never what they said.** It replaced an
+  English stop-word list matched against the transcript (#167), which needed a
+  list per language (#737 was German) and depended on a transcript the chime
+  garbled. Do not add words back.
+- **A wake alone must not stop it** (Voice PE's rule, considered and
+  declined): while audio plays the wake bar is the lower barge bar, so a false
+  wake is likeliest exactly while a timer rings, and it would silence an alarm
+  nobody answered. The preroll frames are skipped for the same reason — they
+  carry the wake word's own tail, which is speech.
+- **Fleet-wide, because arbitration can hand the wake to an Echo that is not
+  ringing** (measured 2026-08-28: the ringing device scored 0.794 and ceded to
+  a quiet one at 0.501).
+
+The accepted cost: a command spoken over a ringing timer stops the timer and
+is not sent to HA. Without the Silero model the wake alone stops the ring,
+since an alarm that cannot be stopped by voice is the worse failure.
+
+**Run on three Echoes, 2026-10-04:** wake plus speech stopped the ring every
+time, including when a different Echo took the wake (15LE stopped VVV's and
+C95's) and when the ringing Echo listened for itself; wake alone resumed after
+four seconds with a peak speech probability of 0.02-0.26. The listening ring
+lights on the Echo that took the wake AND on each ringing one, and stays up
+until `DismissListen.finished` (five quiet frames, or `DISMISS_TAIL_S`): the
+ring stops at the first word, but going dark mid-sentence read as being cut
+off. Stopping an alarm darkens its Echo (`stop_timer_alarm`'s finally), so the
+listening ring is sent again after the dismissal. The wiring in em_controller
+has no unit test.
+
+**A "timer that never started" is usually Home Assistant's LLM, not us.** On
+the same evening three requests on one Echo got "OK. I have started a 10
+second timer." and no timer event at all. HA's debug view showed the
+conversation agent was the LLM (`processed_locally: false`,
+`prefer_local_intents: false`) inside one conversation that had lasted since
+that Echo's first timer; after eight quiet minutes the same sentence worked.
+Our side logs every timer event before acting on it (`on_timer_event`), so no
+log line means no event arrived. Check HA's pipeline debug before our code.
 
 **Overlapping owners are COUNTED, and this is the bug class the two fixes
 share.** `ducked` was one boolean per session, so a barge-in turn or an
@@ -1071,7 +1191,7 @@ single written ladder. `docs/audio-states.md` §2 is the nearest thing.
 | `em_shadow.py` | On-device wake word shadow mode — correlates device-reported threshold crossings with the controller's own detections (clock domains, match window, consume-on-match) |
 | `em_scenes.py` | LED ring scenes — resolves `ledScene`/`ledListenColor`/`ledThinkColor` config into render-ready listening/spinner frames |
 | `em_esphome.py` | ESPHome-mode satellite servers (`EchoMuseSatellite`, `DeviceESPhomeServer`) |
-| `em_arbiter.py` | Multi-device wake arbitration — first to HEAR wins: claims carry capture time (`heard_at`) and the winner is held for window + slack, never revoked; on a mixed fleet `contest()` waits 250ms from hearing and grants the earliest heard |
+| `em_arbiter.py` | Multi-device wake arbitration — claims carry capture time (`heard_at`) and the wake's averaged level; with two or more Echoes `contest()` waits 250ms from hearing, then `pick()` grants the loudest, or the earliest heard when levels cannot be compared; the winner is held for window + slack, never revoked |
 | `em_listen.py` | Private listening (docs/listening.md): `resolve` (what an Echo is actually doing with its mic — the only source for privacy statements), `SessionRouter` (which `0x07` session audio may reach a turn), capture-time maths. Pure, tested in test_listen.py |
 | `em_player.py` | Media playback sessions — `media_player.play_media` → streaming ffmpeg decode → paced 0x02 feed; pause/resume/stop; voice preempts music (`interrupt`/`resume_interrupted`) |
 | `em_config_sections.py` | Fleet-vs-device config scoping — the six sections, `STATE_KEYS`, and the merge that resolves a device's effective config |
@@ -1091,9 +1211,10 @@ single written ladder. `docs/audio-states.md` §2 is the nearest thing.
 | `em_tasks.py` | `spawn` for background tasks nothing awaits: held in a set until done, exception logged when it happens. **No `asyncio.create_task` result is discarded** in em_api/em_controller/em_esphome, and every task wrapping an `Event.wait()` is torn down in a `finally` of the function that made it (`tests/test_tasks.py`, by AST). The second rule is the one that bit: `_run_post_turn_playback` cancelled its helpers at the end of its `try`, so a cancelled playback left two `Event.wait()` tasks pending — "Task was destroyed but it is pending!" on the dev add-on 2026-09-25, reproduced against 2.23.0 |
 | `em_linkauth.py` | The device-link auth decision as a pure function. Split out of `em_controller._link_auth_ok` so it is testable: the suite does not import em_controller, so this was security logic with no coverage until it orphaned a device |
 | `em_output_mute.py` | HA's media-player mute (#675, #678): mute sends volume 0 and remembers the level, unmute restores it; a volume from HA unmutes at it; the device's 0 echoing back is never persisted as `startupVolume`; volume-up on the Echo while muted restores the old level + one button step (8) rather than the button floor; a reconnect while muted re-sends 0. Controller-side so it works on every firmware. Pure, tested, with a source guard that mute is handled wherever `VOLUME_MUTE` is advertised |
-| `em_timers.py` | Voice-assistant timers (#167) — the alarm ring, and the two dismissal matchers that must NOT be one. `is_dismissal` is generous because a missed dismissal leaves the alarm going and HA answering "there are no timers"; `is_dismissal_only` is strict because it suppresses HA's reply, and a false positive there is not a spare stop, it is a lost answer ("turn off the kitchen light" over a ringing alarm). Phrases are stripped longest-first so `turn off` is consumed before the bare `off` strands `turn` |
-| `em_ble_proxy.py` | BLE proxy ESPHome servers — a second, separate ESPHome device per Echo (own port from the shared counter, own mDNS, MAC = serial-derived with the locally-administered bit flipped). Forwards `ble_adverts` control messages from the device's passive scanner (`device/internal/bluetooth`, raw HCI over `/dev/stpbt`; enabling durably disables Android's BT stack) to HA as raw advertisements. Lifecycle = idempotent `reconcile()` driven by `bleProxyEnabled` |
-| `esphome/` | ESPHome native API protocol layer (framing, handshake, vendored protobufs) |
+| `em_timers.py` | Voice-assistant timers (#167) — the timer registry, the alarm sound, and `DismissListen`: whether someone spoke after a wake word heard while a timer rings, which is what stops it by voice. It asks whether, never what, so there is no word list and no language |
+| `em_ble_proxy.py` | BLE proxy ESPHome servers — a second, separate ESPHome device per Echo (own port from the shared counter, own mDNS, MAC = serial-derived with the locally-administered bit flipped). Forwards `ble_adverts` control messages from the device's passive scanner (`device/internal/bluetooth`, raw HCI over `/dev/stpbt`; enabling durably disables Android's BT stack) to HA as raw advertisements. Lifecycle = idempotent `reconcile()` driven by `bleProxyEnabled` | **Connections never go out on a plaintext port** (Wil, 2026-10-03): with `bleProxyConnections` on and firmware announcing `ble_connect`, the proxy is rebuilt with a per-device key (`devices.ble_proxy_key`, schema v31, assign-once), its listener requires it, and only then do the `em_ble_gatt` handlers and the ACTIVE_CONNECTIONS flags exist — one fact (`key is not None`) decides all three, pinned by `tests/test_ble_proxy_rules.py`. The key reaches the dashboard through one admin GET and nothing else, like the Sendspin token. Turning it on makes HA ask for the key (reauth) and the proxy delivers nothing until it has it; an offline device keeps its last mode so a reconnect does not flip the port and make HA ask again |
+| `em_ble_gatt.py` | Bluetooth CONNECTIONS through an Echo (#656). `GattLink` is one Echo's bridge (the `0x08` data-plane JSON: request ids, results, slots); `GattProxy` maps one Home Assistant connection's ESPHome Bluetooth messages onto it. Takes the protobuf module as an argument, so the suite needs none. Rules that are Home Assistant's, each confirmed against its real client: the characteristic handle is the VALUE handle; a write without response is never answered with an error (errors match on address+handle and would fail the next request); a disconnect gets exactly one `connected=false`; HA writes the CCCD itself. **Events are queued behind results**, because a result wakes its task a loop step later and "write ok, then disconnected" otherwise reaches HA reversed |
+| `esphome/` | ESPHome native API protocol layer (framing, handshake, vendored protobufs). `noise.py` + the encrypted half of `frame_protocol.py` are ESPHome's API encryption, responder side, used ONLY by a Bluetooth proxy with connections on. `noise.py` is held to a published vector; `tools/noise_client_check.py` and `tools/gatt_client_check.py` run `aioesphomeapi` itself against a listener (two processes: its `api.proto` collides with our vendored one). Run both after touching either file |
 
 ## Fleet vs device scoping (schema v8)
 
@@ -1316,6 +1437,13 @@ public issue — built because remote diagnosis was costing days per round trip
 new database column is excluded until someone deliberately adds it: the
 failure mode is that support loses a field, never that user data reaches a
 public issue. A denylist gets this wrong once and it is unrecoverable.
+
+**`controller.log_levels` is the levels IN FORCE, read from the loggers**
+(#797, @forming), never the `LOG_LEVELS` string: a pair naming a logger that
+does not exist is dropped with a warning, and `DEBUG` sets the global level
+underneath whatever was asked for. Only loggers with a level of their own are
+listed, plus the root. It is there because a thin log tail is otherwise
+ambiguous between "nothing happened" and "it was not being logged".
 
 Three rules, enforced by `tests/test_support.py`, which asserts secret values
 appear **nowhere in the serialised output** rather than checking field-by-field
@@ -1714,6 +1842,30 @@ The WebUSB/ADB wizard that takes a stock Dot to a fielded device. Four rules,
 each of which has already been broken once and each of which fails *silently*
 when broken — the wizard drives hardware nobody is watching a log of.
 
+**The failure panel carries the reason, and what it offers must be able to
+help (#850, 2026-10-11).** `stepError` holds the failed step's message and the
+panel shows its first paragraph (`_stepFailureReason`); command output stays
+in the transcript. Until then the panel read "Click Retry first" whatever had
+happened. Three consequences of the same rule:
+
+- **FireOS step 3 asks for `f1r30s.zip`.** The flow has always read
+  `/sdcard/f1r30s.zip` off the device and never uploaded it. `ensureF1r30s`
+  runs ahead of `runPatchBoot`: absent, the panel shows a picker, and the
+  retry checks the file against `_F1R30S_SHA256` (the build the August
+  recovery tool pinned), pushes it and reads it back. A probe that did not
+  run to its `_F1CHK` sentinel is not "absent". It is a separate function
+  because `boot_target.test.mjs` builds `runPatchBoot` with an explicit list
+  of injected names, so a new dependency inside it fails that test.
+- **The restore-escrow panel needs an escrow**: `emosRef`, or `restored` (a
+  session resumed after a reload, where the operator may hold the download).
+  It used to show on any failure at steps 2-4, including one before the
+  escrow, asking for an image "downloaded at step 3" that did not exist.
+- **A registered Echo at step 1** offers keep-record or delete, shows no
+  Retry (it could only stop again), and keep-record runs the step.
+
+Found by Wil running the FireOS wizard in the 2.26.0 UAT on an Echo whose
+`/sdcard` had been cleared after a stock restore.
+
 - **The finishing reboot belongs to the LAST step, and moving the last step
   means moving the reboot.** Install EchoMuse used to be last, so it ended by
   rebooting and clearing `adb`. When the wake word asset step was appended
@@ -1836,7 +1988,13 @@ throughout — so the rules below are all one rule seen from different angles.
   "`su` is not working", and the install step logged `Cleared.` after every
   command had failed. Probes carry a sentinel (`echo _CLEARCHK`) so the two
   answers are distinguishable — the same fix `_sync_start_script` needed for
-  `_SHELL_OK`, in a different file.
+  `_SHELL_OK`, in a different file. Patch Boot Image and Pre-seed Root DB
+  read their artifact back the same way (#723, @forming: `_magiskbootVerdict`
+  with `_MBCHK`, `_preseedVerdict` with `_DBCHK`). **The size probe relies on
+  `wc`, and that is only safe where the step runs**: TWRP on a Dot 2 is
+  BusyBox 1.22.1 and prints `DB=36864` unpadded (run on VVV, 2026-10-08),
+  while FireOS 5's own shell has no `wc` at all and prints `DB=` for a file
+  that exists. A probe moved to another shell needs running there first.
 - **Verify the bytes you wrote, not the block that contains them.** The flash
   step read back whole megabytes and compared against the image zero-padded to
   match, so 425,984 bytes of the PREVIOUS boot image were checked against zeros
@@ -2122,6 +2280,15 @@ It is an allowlist twice over: an unlisted probe name is dropped whole, and
 the key/value probes have their keys listed too. `tests/test_support.py` pins
 the JS probe list against the Python allowlist. Drift there is silent, since
 a probe collected and dropped looks identical to one never asked for.
+
+**The emOS serial steps have no ADB, so they ask over the console (#773).**
+`_EMOS_PROBES` holds one probe, `net_log`: the tail of `/run/net.log`, the
+only place the supplicant and the DHCP client write. Chosen by step, not by
+whether an ADB handle is still held. Its redaction is `_probe_net_log`, not
+`_scrub` alone: wpa_supplicant quotes an SSID without escaping an apostrophe,
+so the quote-matching rule turned `SSID 'Bob's WiFi'` into `<redacted>s
+WiFi'`. Each line is cut where a name starts, and two tails are kept because
+they are the diagnosis (the channel, and `reason=WRONG_KEY`).
 
 Scan results are the real tension: the flags and frequency ARE the diagnosis
 (`[SAE-CCMP]` is the whole answer to #82) while the names locate someone's

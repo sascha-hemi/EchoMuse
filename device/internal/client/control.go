@@ -624,7 +624,7 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 		"base_os": platform.Base(),
 		// Which board detection matched (pkg/board), "unknown" when none did.
 		// Unread by current controllers, so safe to add unnegotiated.
-		"board": board.IDOf(board.Detect("")),
+		"board": board.IDOf(board.Current()),
 	}
 	// The running kernel, `uname -m` and `uname -r`. Generic across boards, and
 	// on biscuit the only thing that separates emOS on FireOS 5's 64-bit
@@ -1266,18 +1266,37 @@ func capabilities() []string {
 	//
 	// "volume_cue": this firmware can play a physical-button volume preview
 	// at the new level, and suppress it while voice or music is audible.
+	// "wake_mic": this firmware reads `wakeMic` and can listen for the wake
+	// word on a perimeter mic when the centre one is dead (#705).
+	// "wake_word_off": this firmware honours wakeWordEnabled=false (#286),
+	// so a crossing opens no session. Without it the controller declines
+	// HA's "No wake word" for a privately listening Echo, which would
+	// otherwise keep sending audio on every wake until the close arrived.
+	//
+	// "remote_volume_arc": this firmware can show the existing cyan level arc
+	// for live remote volume changes when remoteVolumeArc is enabled. The
+	// setting is off by default, and boot-time volume restore stays silent.
+	// "response_level": this firmware can apply the configured relative gain
+	// to the voice plane before it is mixed with music (#636).
 	//
 	// "pairing": this firmware asks to pair itself when its owner holds the
 	// action button 5 s (pairing.go). Without it the controller offers the
 	// admin a Pair action instead, since the device cannot ask.
+	//
+	// "ble_connect": this firmware can hold Bluetooth LE connections for the
+	// controller and speak GATT over them (#656), exchanging requests and
+	// results as ble-gatt frames on the data plane. It does so only against
+	// a controller announcing the same feature, and only while
+	// bleProxyConnections is on.
 	//
 	// "sendspin": this firmware can be a Sendspin player (internal/sendspin),
 	// switched by sendspinEnabled. Whether it is running, and paired, is the
 	// sendspin status, for the aec_hw_ref reason.
 	caps := []string{"mic", "speaker", "leds", "led_anim", "buttons",
 		"oww_shadow", "oww_trigger", "button_hold", "audio_mix",
-		"aec_hw_ref", "oww_local_only", "output_chain", "wake_cue", "volume_cue", "pairing",
-		"sendspin"}
+		"aec_hw_ref", "oww_local_only", "output_chain", "wake_cue", "volume_cue", "remote_volume_arc",
+		"response_level", "wake_mic", "pairing",
+		"wake_word_off", "sendspin", "ble_connect"}
 	if als.Present() {
 		caps = append(caps, "ambient_light")
 	}
@@ -1519,6 +1538,12 @@ func (c *ControlClient) HasFeature(name string) bool {
 // controller ignores unknown frame types and would drop every advert in
 // silence.
 const FeatureBleAdvertsData = "ble_adverts_data"
+
+// FeatureBleConnect is announced by a controller that drives Bluetooth LE
+// connections through this device (frameTypeBleGatt both ways). Without it
+// nothing is sent: an older controller ignores the frame, and a result nobody
+// reads is a connection held for nobody.
+const FeatureBleConnect = "ble_connect"
 
 // FeatureListenSession is announced by a controller that understands
 // private-listening sessions: listen_state, session-tagged oww_wake, the

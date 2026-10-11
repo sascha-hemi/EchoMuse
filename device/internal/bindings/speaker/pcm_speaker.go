@@ -4,6 +4,7 @@ package speaker
 
 import (
 	"context"
+	"errors"
 	"log"
 	"math"
 	"os"
@@ -15,13 +16,12 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/bindings/codec"
 	"github.com/wilbowes/EchoMuse/internal/bindings/mixer"
 	"github.com/wilbowes/EchoMuse/internal/outchain"
+	"github.com/wilbowes/EchoMuse/pkg/board"
 
 	"github.com/Binozo/GoTinyAlsa/pkg/pcm"
 	"github.com/Binozo/GoTinyAlsa/pkg/tinyalsa"
 )
 
-// cardNr/deviceNr live in pcmstatus.go so the host test can pin them against
-// the status path — this file is ARM-only (build tag `server`).
 const periodSize = 2048
 
 // The hardware tier: what ALSA holds ahead of the DAC. It is sized ONLY for
@@ -64,8 +64,12 @@ const primePeriods = 24
 var silencePeriod = make([]byte, periodBytes)
 
 type PcmSpeaker struct {
-	session *tinyalsa.AudioSession
-	stopCh  chan struct{}
+	// pcm is the playback device, found by name (pkg/board) in Init, and
+	// statusFile its substream's status in procfs.
+	pcm        board.PCMAddr
+	statusFile string
+	session    *tinyalsa.AudioSession
+	stopCh     chan struct{}
 	// jackInserted is the plug position last applied by SetJackRouting, and
 	// jackKnown says whether one has been applied at all. The reconcile loop
 	// needs a DESIRED state to compare against, and before jack.Watch has run
@@ -145,6 +149,13 @@ type PcmSpeaker struct {
 	// level whatever the volume.
 	vol softVolume
 	cue cueState
+	// response is a relative gain on the voice plane before it is mixed with
+	// music. The device volume still runs on the completed mix below, so the
+	// buttons remain authoritative; response caps itself against vol so their
+	// combined gain never exceeds unity (#636).
+	response      responseGain
+	responseMix   []float64
+	responseGains []float64
 
 	// src is a second producer for the music plane (Sendspin, #89): a pull
 	// source, consulted only while the 0x04 plane has nothing, so Home
@@ -196,7 +207,7 @@ func (p *PcmSpeaker) pullSource() []byte {
 		return nil
 	}
 	before := time.Now()
-	b, err := os.ReadFile(statusPath(cardNr, deviceNr))
+	b, err := os.ReadFile(p.statusFile)
 	read := time.Since(before)
 	if err != nil {
 		return nil
@@ -240,19 +251,23 @@ func (p *PcmSpeaker) OnStreamStats(cb func(StreamStats)) {
 
 func NewPcmSpeaker(echoTap func([]byte), levelTap func(rms float64)) (*PcmSpeaker, error) {
 	s := &PcmSpeaker{
-		stopCh:      make(chan struct{}),
-		deadCh:      make(chan struct{}),
-		echoTap:     echoTap,
-		levelTap:    levelTap,
-		chain:       outchain.New(48000),
-		chainParams: outchain.DefaultParams(),
-		chainBuf:    make([]byte, periodBytes),
-		srcBuf:      make([]byte, periodBytes),
+		stopCh:        make(chan struct{}),
+		deadCh:        make(chan struct{}),
+		echoTap:       echoTap,
+		levelTap:      levelTap,
+		chain:         outchain.New(48000),
+		chainParams:   outchain.DefaultParams(),
+		chainBuf:      make([]byte, periodBytes),
+		srcBuf:        make([]byte, periodBytes),
+		responseMix:   make([]float64, periodSize*2),
+		responseGains: make([]float64, periodSize),
 	}
 	s.voice = newAudioStream(audioChanDepth, s.deadCh)
 	s.music = newAudioStream(audioChanDepth, s.deadCh)
 	s.duckTarget.Store(unityGain)
 	s.mixer.SetGainImmediate(unityGain)
+	s.response.setDB(0)
+	s.response.cur = 1
 	if err := s.Init(); err != nil {
 		return nil, err
 	}
@@ -260,6 +275,12 @@ func NewPcmSpeaker(echoTap func([]byte), levelTap func(rms float64)) (*PcmSpeake
 }
 
 func (p *PcmSpeaker) Init() error {
+	pb := board.CurrentLayout().Playback
+	if pb == nil {
+		return errors.New("speaker: playback PCM not found on this board")
+	}
+	p.pcm = *pb
+	p.statusFile = statusPath(pb.Card, pb.Device)
 	// Startup order matters for the audible click (2026-07-10): the amp
 	// must come up onto a DAC that is already clocking silence, and the
 	// unmute must come last. The old order (amp on → unmute → open PCM)
@@ -274,7 +295,7 @@ func (p *PcmSpeaker) Init() error {
 	// device where EchoMuse drives the codec directly, mediaserver has no
 	// work to do and is only ever in the way.
 	exec.Command("stop", "media").Run()
-	waitForFreePcm(cardNr, deviceNr, pcmFreeTimeout)
+	waitForFreePcm(p.pcm.Card, p.pcm.Device, pcmFreeTimeout)
 	// Connect the DAC to the output mixer before opening the stream: DAPM
 	// decides what to power at stream open, and an unrouted DAC is powered
 	// down, which presents as a clean "voice stream complete, underruns=0"
@@ -282,7 +303,7 @@ func (p *PcmSpeaker) Init() error {
 	codec.EnsureRoutes()
 	mixer.Set(mixer.PlaybackVolume, "0") // mute before touching amp or stream
 
-	device := tinyalsa.NewDevice(cardNr, deviceNr, pcm.Config{
+	device := tinyalsa.NewDevice(p.pcm.Card, p.pcm.Device, pcm.Config{
 		Channels:         2,
 		SampleRate:       48000,
 		PeriodSize:       alsaPeriodSize,
@@ -419,7 +440,7 @@ func (p *PcmSpeaker) ReconcileJackRouting() int {
 	}
 
 	current := map[string]string{}
-	for _, ctl := range []string{ctlSpeakerAmp, ctlHPDriverGain} {
+	for _, ctl := range []string{ctlSpeakerAmp, ctlHPDriverGain, ctlDacMux} {
 		if v, err := mixer.Get(ctl); err == nil {
 			current[ctl] = v
 		} // a failed read is not evidence of drift
@@ -494,6 +515,25 @@ func (p *PcmSpeaker) silenceLoop() {
 			music = p.pullSource()
 		}
 
+		var response responsePeriod
+		hasResponse := voice != nil
+		var responseGains []float64
+		wideResponse := false
+		if hasResponse {
+			// One atomic read for the whole response period. Response gain is
+			// capped against this target and the same target is applied below,
+			// so a volume command arriving between those stages cannot briefly
+			// drive their product above unity.
+			volumeTarget := p.vol.targetGain()
+			response = p.response.begin(&p.vol, len(voice)/4, volumeTarget)
+			responseGains = p.responseGains[:len(voice)/4]
+			response.fillGains(responseGains)
+			wideResponse = response.boosted(responseGains)
+			response.finish(responseGains)
+		} else {
+			p.response.settle(&p.vol)
+		}
+
 		// The ring's level must be measured BEFORE mixing: Mix sums into the
 		// voice buffer in place, so afterwards there is no voice-only signal
 		// left to measure.
@@ -502,23 +542,33 @@ func (p *PcmSpeaker) silenceLoop() {
 			level = periodRMS(voice)
 		}
 
-		out := p.mixer.Mix(voice, music, p.duckTarget.Load())
-		process := out != nil
-		if out == nil {
-			out = silencePeriod
-			if !p.chain.Idle() {
-				// Filter tails still ringing out of the last audio.
-				copy(p.chainBuf, silencePeriod)
-				out, process = p.chainBuf, true
-			}
-		}
-		if process {
-			if applied := p.chain.Process(out); applied != nil {
+		var out []byte
+		if wideResponse {
+			wide := p.mixer.MixResponse(p.responseMix, voice, music, p.duckTarget.Load(), responseGains)
+			if applied := p.chain.ProcessFloat(wide, responseGains); applied != nil {
 				log.Printf("[speaker] output chain: %s", applied)
 			}
-			p.vol.apply(out)
+			out = voice
+			p.vol.applyFloat(wide, out, response.volumeTarget)
 		} else {
-			p.vol.settle()
+			out = p.mixer.Mix(voice, music, p.duckTarget.Load())
+			process := out != nil
+			if out == nil {
+				out = silencePeriod
+				if !p.chain.Idle() {
+					// Filter tails still ringing out of the last audio.
+					copy(p.chainBuf, silencePeriod)
+					out, process = p.chainBuf, true
+				}
+			}
+			if process {
+				if applied := p.chain.Process(out); applied != nil {
+					log.Printf("[speaker] output chain: %s", applied)
+				}
+				p.vol.apply(out)
+			} else {
+				p.vol.settle()
+			}
 		}
 		// After the volume, so the cue is the same loudness at any volume.
 		if cued := p.mixCue(out); cued != nil {
@@ -754,6 +804,11 @@ const dacUnity = "127"
 // SetVolume sets the playback volume as a device level (0..127, 0.5dB per
 // step, unity at 127). Takes effect from the next period, ramped across it.
 func (p *PcmSpeaker) SetVolume(level int) { p.vol.set(VolumeGain(level)) }
+
+// SetResponseGainDB sets the gain applied only to the voice plane, before it is
+// mixed with music. It is relative to the device volume and dynamically capped
+// so the combined gain cannot exceed unity.
+func (p *PcmSpeaker) SetResponseGainDB(db float64) { p.response.setDB(db) }
 
 // Close shuts the speaker down in the reverse of Init's bring-up: mute,
 // amp off, then tear the stream down. Muting first makes the PCM-close

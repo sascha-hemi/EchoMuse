@@ -25,6 +25,9 @@ Deeper technical references live elsewhere:
   contract a device binary implements: the three WebSocket planes, capability
   negotiation, `/control` messages, `/data` frames, config push, link auth, and
   the `crown` board profile. Read this before building bindings for a new board.
+- [boards.md](boards.md) — how the firmware detects its board and finds each
+  part by name, which files describe a board, and what to watch for when
+  trying the firmware on new hardware.
 - [audio-states.md](audio-states.md) — who owns the speaker and what is on the
   wire: the two audio planes, ducking, flush semantics, and the open questions
   about how voice, music, announcements and alarms interact.
@@ -37,3 +40,5 @@ Deeper technical references live elsewhere:
   chronological record of what was built, what broke, and what we got wrong.
 - [CLAUDE.md](../CLAUDE.md) — codebase orientation for developers (and AI
   assistants).
+- [archived/](archived/) — documents kept as a record and no longer current.
+  The v2.2.0 controller design spec is there.

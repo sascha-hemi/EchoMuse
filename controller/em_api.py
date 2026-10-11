@@ -419,6 +419,7 @@ async def create_app() -> web.Application:
     app.router.add_post("/api/devices/{id}/approve",      _post_approve)
     app.router.add_get("/api/devices/{id}/config",        _get_device_config)
     app.router.add_get("/api/devices/{id}/sendspin/token", _get_sendspin_token)
+    app.router.add_get("/api/devices/{id}/ble_proxy/key", _get_ble_proxy_key)
     app.router.add_post("/api/devices/{id}/config",       _post_device_config)
     app.router.add_get("/api/devices/{id}/logs",          _get_device_logs)
     app.router.add_get("/api/devices/{id}/turns",         _get_device_turns)
@@ -1150,6 +1151,29 @@ SENDSPIN_TOKEN_TIMEOUT_S = 8
 
 
 @auth.require_admin
+async def _get_ble_proxy_key(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/ble_proxy/key — the encryption key Home Assistant
+    asks for when it adds or re-authenticates this Echo's Bluetooth proxy.
+
+    Handed to the one request and nothing else: never logged, never put in an
+    event (events reach every open tab and support bundles). It is all that
+    stands between the LAN and whatever the proxy can connect to. Admin only
+    for the same reason. There is a key only while connections are on —
+    a passive proxy is unencrypted and has nothing to show.
+    """
+    device_id = request.match_info["id"]
+    status = em_ble_proxy.get_status(device_id)
+    if status is None or not status.get("connections"):
+        return _error("connections_off",
+                      "Turn on Bluetooth connections for this Echo first", 409)
+    key = await asyncio.get_event_loop().run_in_executor(
+        None, db.ensure_ble_proxy_key, device_id)
+    if not key:
+        return _error("not_found", "Unknown device", 404)
+    return _ok({"key": key})
+
+
+@auth.require_admin
 async def _get_sendspin_token(request: web.Request) -> web.Response:
     """GET /api/devices/{id}/sendspin/token — the pairing token to paste
     into Music Assistant.
@@ -1362,6 +1386,11 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
         live.wake_sound = bool(effective["wakeSound"])
     if "micGainDb" in effective:
         live.mic_gain_db = float(effective["micGainDb"])
+    # What a wake's level reading still contains; see em_arbiter.pick.
+    if "adcMicpga" in effective:
+        live.adc_gains = (int(effective["adcMicpga"]), live.adc_gains[1])
+    if "adcDigitalGain" in effective:
+        live.adc_gains = (live.adc_gains[0], int(effective["adcDigitalGain"]))
     if "owwOnDevice" in effective:
         # Resolved against the CAPABILITY, not taken at face value: "on"
         # against firmware that cannot trigger would stop this controller
@@ -6497,6 +6526,8 @@ def _merge_device(row, boot: dict | None = None) -> dict:
         "connected":        live is not None,
         "speaking":         live.speaking  if live else False,
         "muted":            getattr(live, "muted",     False) if live else False,
+        # Stored, not live (#286): an offline device reports HA's last choice.
+        "wake_word":        db.get_wake_word_enabled(device_id),
         "listening":        getattr(live, "listening", False) if live else False,
         "thinking":         getattr(live, "thinking",  False) if live else False,
         "stats":            live.stats if live else None,
@@ -6562,9 +6593,13 @@ def _merge_device(row, boot: dict | None = None) -> dict:
         "listen":          _listen_json(live) if live else None,
         "wakeCueCapable": getattr(live, "wake_cue_capable", False) if live else False,
         "volumeCueCapable": getattr(live, "volume_cue_capable", False) if live else False,
+        "wakeMicCapable": getattr(live, "wake_mic_capable", False) if live else False,
+        "remoteVolumeArcCapable": getattr(live, "remote_volume_arc_capable", False) if live else False,
+        "responseLevelCapable": getattr(live, "response_level_capable", False) if live else False,
         # Sendspin player (#89): whether the firmware has one, and its status
         # (no secrets; the pairing token is its own request).
         "sendspinCapable": getattr(live, "sendspin_capable", False) if live else False,
+        "bleConnectCapable": getattr(live, "ble_connect_capable", False) if live else False,
         "sendspin":        getattr(live, "sendspin", None) if live else None,
         "audioMixCapable": getattr(live, "audio_mix_capable", False) if live else False,
         # Gates the AEC delay slider, which only means anything on the

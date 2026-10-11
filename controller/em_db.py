@@ -20,6 +20,8 @@ Usage:
     db.log_device(device_id, "info", "device", "Connected")
 """
 
+import secrets
+import base64
 import hashlib
 import json
 import logging
@@ -182,6 +184,10 @@ DEFAULT_DEVICE_CONFIG = {
     # cannot perform. A taste parameter — it wants tuning by ear in a real
     # room, like the LED meter curve, not a firmware push per attempt.
     "duckDb": -18.0,
+    # Voice-response gain relative to the device volume. Firmware maps
+    # low / medium / high to 0 / +6 / +12dB before mixing with music, then
+    # tapers the boost near maximum so combined gain never exceeds unity.
+    "responseLevel":   "low",
     # streamReply: start speaking when Home Assistant says the reply's first
     # text has arrived (its tts_start_streaming signal) instead of when the whole
     # reply is done. Default OFF: it is faster when the model and the TTS engine
@@ -239,6 +245,13 @@ DEFAULT_DEVICE_CONFIG = {
     # Android Bluetooth stack on the device (required — /dev/stpbt is
     # single-owner) and brings up a second ESPHome listener + mDNS entry.
     "bleProxyEnabled":  False,
+    # bleProxyConnections: Home Assistant may open Bluetooth connections
+    # through the proxy (#656) — locks, SwitchBot, anything that needs more
+    # than adverts. Default off, and it needs bleProxyEnabled. Switching it on
+    # makes that proxy's ESPHome port require an encryption key
+    # (em_ble_proxy): a connection can operate the device at the other end,
+    # and the port had no authentication.
+    "bleProxyConnections": False,
     # sendspinEnabled: the device runs a Sendspin player (#89) that Music
     # Assistant connects to directly for synchronised multi-room audio.
     # Default off: it opens a listening port and an mDNS record on the Echo.
@@ -263,6 +276,9 @@ DEFAULT_DEVICE_CONFIG = {
     # behind it and False is the one that has not been run in months.
     "beamformingEnabled": True,
     "beamAngle":        -1,
+    # wakeMic: which mic the wake word listens on. 0 = centre (default),
+    # 1-6 = perimeter MK1-MK6. For a dead centre mic only (#705).
+    "wakeMic":          0,
     "eqBands":          [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     "eqLoudness":       False,
     # Output limiter. On by default: the EQ chain hard-clipped anything it
@@ -282,6 +298,10 @@ DEFAULT_DEVICE_CONFIG = {
     "ledScene":         "standard",
     "ledListenColor":   "#00b400",
     "ledThinkColor":    "#00c800",
+    # Opt-in accessibility feedback for volume changes made from HA, the
+    # dashboard, automations, or another remote source. Physical buttons show
+    # the cyan arc regardless; mute and boot restore stay silent.
+    "remoteVolumeArc":  False,
     # Playback "meter" ring response curve — how hard the ring throbs with
     # the speaker level. Device-side defaults live in animator.go
     # (meterDefaults) and these mirror them; both are clamped independently.
@@ -1119,6 +1139,16 @@ MIGRATIONS: list[str] = [
 
     UPDATE system_config SET value = '30' WHERE key = 'schema_version';
     """,
+
+    # v31 — the API encryption key for a device's Bluetooth proxy (#656).
+    # Home Assistant is given it once, as the ESPHome device's "encryption
+    # key". NULL until connections are first switched on for that device; a
+    # passive proxy stays unencrypted and needs none.
+    """
+    ALTER TABLE devices ADD COLUMN ble_proxy_key TEXT;
+
+    UPDATE system_config SET value = '31' WHERE key = 'schema_version';
+    """,
 ]
 
 # Post-migration fixups that need Python rather than SQL. Keyed by the schema
@@ -1897,6 +1927,45 @@ def get_device_config(device_id: str) -> dict:
         return dict(DEFAULT_DEVICE_CONFIG)
 
 
+# Devices HA's wake word picker has turned off (#286). Stored because HA
+# never sends the picker's state back. Not a config key: a dashboard save
+# would overwrite it with whatever that page last loaded.
+_WAKE_WORD_OFF_KEY = "wake_word_off"
+
+
+def _wake_word_off_ids(conn: sqlite3.Connection) -> list[str]:
+    row = conn.execute(
+        "SELECT value FROM system_config WHERE key = ?", (_WAKE_WORD_OFF_KEY,)
+    ).fetchone()
+    if row is None or not row["value"]:
+        return []
+    try:
+        ids = json.loads(row["value"])
+    except (json.JSONDecodeError, TypeError):
+        log.warning("[db] Invalid wake_word_off JSON — treating every device as on")
+        return []
+    return [i for i in ids if isinstance(i, str)] if isinstance(ids, list) else []
+
+
+def get_wake_word_enabled(device_id: str) -> bool:
+    """Whether HA's picker leaves this device's wake word on. Default on."""
+    assert _conn is not None, "db.init() has not been called"
+    with _db_lock:
+        return device_id not in _wake_word_off_ids(_conn)
+
+
+def set_wake_word_enabled(device_id: str, enabled: bool) -> None:
+    """Record HA's picker choice for this device. Read-modify-write in one tx."""
+    with _tx() as conn:
+        ids = [i for i in _wake_word_off_ids(conn) if i != device_id]
+        if not enabled:
+            ids.append(device_id)
+        conn.execute(
+            "INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)",
+            (_WAKE_WORD_OFF_KEY, json.dumps(sorted(ids))),
+        )
+
+
 def get_global_device_config() -> dict:
     """
     Return the fleet-wide default device config.
@@ -2106,6 +2175,8 @@ def delete_device(device_id: str) -> None:
         conn.execute("DELETE FROM device_boots WHERE device_id = ?", (device_id,))
         conn.execute("DELETE FROM device_wear WHERE device_id = ?", (device_id,))
         conn.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
+    # A re-added device is new to HA, so it starts listening.
+    set_wake_word_enabled(device_id, True)
     try:
         removed = em_recordings.delete_device(device_id)
         if removed:
@@ -2299,6 +2370,32 @@ def ensure_ble_proxy_port(device_id: str) -> Optional[int]:
             )
             log.info(f"[db] BLE proxy port set: {device_id} → {port}")
     return port
+
+
+def ensure_ble_proxy_key(device_id: str) -> Optional[str]:
+    """
+    Return this device's Bluetooth proxy encryption key (base64 of 32 random
+    bytes, the form Home Assistant asks for), creating it on first call.
+    Assigned once and kept: Home Assistant stores it, so a key that changed
+    would lock its config entry out. None if the device is unknown.
+
+    Never log it. It is what stands between the LAN and whatever the proxy
+    can connect to.
+    """
+    with _tx() as conn:
+        row = conn.execute(
+            "SELECT ble_proxy_key FROM devices WHERE device_id = ?", (device_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["ble_proxy_key"]:
+            return row["ble_proxy_key"]
+        key = base64.b64encode(secrets.token_bytes(32)).decode()
+        conn.execute(
+            "UPDATE devices SET ble_proxy_key = ? WHERE device_id = ?", (key, device_id),
+        )
+        log.info(f"[db] BLE proxy encryption key created for {device_id}")
+    return key
 
 
 def free_ble_proxy_port(device_id: str) -> None:
