@@ -62,6 +62,40 @@ def decline_off(*, want: bool, listening_locally: bool, device_can: bool) -> boo
     return not want and listening_locally and not device_can
 
 
+def stored_off_unsupported(*, stored: bool, listening_locally: bool,
+                           device_can: bool) -> bool:
+    """
+    Whether a STORED "No wake word" has to be given up because this firmware
+    cannot honour it (#776).
+
+    `decline_off` is the same rule applied to a request arriving now. This is
+    its mirror for a choice already in the database, which nothing ever
+    revisited: the device keeps opening a session on every wake and the
+    controller closes each one, while Home Assistant reads "No wake word" the
+    whole time. Reaching this needs the firmware to go backwards after the
+    picker was set — a slot rollback, or a downgrade after #552.
+
+    Returns True to report the wake word ON while this firmware runs. The
+    stored value stays off (Wil, 2026-10-06): after an upgrade the firmware
+    can honour it again, and the choice comes back without being set twice.
+
+    An Echo STREAMING to the controller with the wake word off is honouring
+    it — the controller stops that stream itself — so it is never reverted.
+    Only firmware that cannot stop at the crossing is.
+    """
+    return stored and listening_locally and not device_can
+
+
+def ha_needs_refresh(*, told: bool | None, enabled: bool) -> bool:
+    """Whether Home Assistant must be made to read the wake word state again
+    after the controller changed it without being asked (#776).
+
+    HA reads the picker's state when it connects and after its own writes,
+    never otherwise. `told` is what it last read, None if it has not asked:
+    it will read the current value when it does."""
+    return told is not None and told != enabled
+
+
 def on_request(*, want: bool, enabled: bool, mic_muted: bool) -> Transition:
     """HA's picker asked for `want`, with the wake word `enabled` and the mic
     mute button `mic_muted`."""
