@@ -4849,9 +4849,9 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
             ring_alarm=_ring_alarm,
             stop_alarm=_stop_alarm,
             start_conversation=_start_conversation,
+            board_id=device.board_id,
             set_wake_word=_set_wake_word,
             wake_word_enabled=device.wake_word_enabled,
-            board_id=device.board_id,
         )
         # #776: firmware that can honour the stored choice again (an upgrade)
         # may meet a Home Assistant still showing the temporary "on". Without
